@@ -14,7 +14,11 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 
-from utils import get_psutil, get_websocket, log_write as _log
+import versholn
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 @dataclass
@@ -63,7 +67,7 @@ class ChromeLauncher:
 
     def adopt(self) -> bool:
         """Attach to an existing Chrome process listening on the configured port."""
-        psutil = get_psutil(globals())
+        psutil = versholn.install_and_import("psutil")
         for conn in psutil.net_connections(kind="tcp"):
             if conn.laddr.port == self.config.remote_debugging_port and conn.status == "LISTEN" and conn.pid:
                 try:
@@ -187,7 +191,7 @@ class ChromeHealth:
 
     def verify_running_instance(self, config: "ChromeLaunchConfig") -> bool:
         """Return True if the Chrome listening on port was launched with matching port and user-data-dir."""
-        psutil = get_psutil(globals())
+        psutil = versholn.install_and_import("psutil")
         for conn in psutil.net_connections(kind="tcp"):
             if conn.laddr.port == self._port and conn.status == "LISTEN" and conn.pid:
                 try:
@@ -278,7 +282,7 @@ class CDPClient:
         with urllib.request.urlopen(url, timeout=5) as resp:
             info = json.loads(resp.read())
         ws_url = info["webSocketDebuggerUrl"]
-        websocket = get_websocket(globals())
+        websocket = versholn.install_and_import("websocket-client", import_as="websocket")
         self.ws = websocket.WebSocket()
         self.ws.connect(ws_url)
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
