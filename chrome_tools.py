@@ -14,7 +14,22 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 
-import versholn
+
+def _get_versholn():
+    """Load versholn without a module-level import (stdlib-safe bootstrap)."""
+    import sys
+    try:
+        import versholn as _v
+    except ImportError:
+        import pathlib
+        here = pathlib.Path(__file__).resolve()
+        for parent in here.parents:
+            candidate = parent / "versholn"
+            if candidate.is_dir():
+                sys.path.insert(0, str(candidate))
+                break
+        import versholn as _v
+    return _v
 
 
 def _log(msg: str) -> None:
@@ -67,7 +82,7 @@ class ChromeLauncher:
 
     def adopt(self) -> bool:
         """Attach to an existing Chrome process listening on the configured port."""
-        psutil = versholn.install_and_import("psutil")
+        psutil = _get_versholn().install_and_import("psutil")
         for conn in psutil.net_connections(kind="tcp"):
             if conn.laddr.port == self.config.remote_debugging_port and conn.status == "LISTEN" and conn.pid:
                 try:
@@ -191,7 +206,7 @@ class ChromeHealth:
 
     def verify_running_instance(self, config: "ChromeLaunchConfig") -> bool:
         """Return True if the Chrome listening on port was launched with matching port and user-data-dir."""
-        psutil = versholn.install_and_import("psutil")
+        psutil = _get_versholn().install_and_import("psutil")
         for conn in psutil.net_connections(kind="tcp"):
             if conn.laddr.port == self._port and conn.status == "LISTEN" and conn.pid:
                 try:
@@ -282,7 +297,7 @@ class CDPClient:
         with urllib.request.urlopen(url, timeout=5) as resp:
             info = json.loads(resp.read())
         ws_url = info["webSocketDebuggerUrl"]
-        websocket = versholn.install_and_import("websocket-client", import_as="websocket")
+        websocket = _get_versholn().install_and_import("websocket-client", import_as="websocket")
         self.ws = websocket.WebSocket()
         self.ws.connect(ws_url)
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
