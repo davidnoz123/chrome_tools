@@ -1457,18 +1457,14 @@ class _ReplSession:
 
     @classmethod
     def get_singleton(cls, config: "ChromeLaunchConfig | None" = None) -> "_ReplSession":
-        """Return the persistent session stored in __main__ globals().
+        """Return the persistent session stored in globals().
 
-        runpy._run_module_as_main re-executes the module into
-        sys.modules['__main__'].__dict__ without clearing it, so any key
-        written there survives between re-runs in the same process.
+        runpy._run_module_as_main re-executes the module into __main__'s globals()
+        without clearing it, so any key written there survives between re-runs.
         """
-        g = sys.modules["__main__"].__dict__
-        session = g.get("_repl")
-        if not isinstance(session, cls):
-            session = cls(config)
-            g["_repl"] = session
-        return session
+        if "_repl" not in globals():
+            globals()["_repl"] = cls(config)
+        return globals()["_repl"]
 
 
 # ---------------------------------------------------------------------------
