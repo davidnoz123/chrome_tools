@@ -1,12 +1,23 @@
 
 r"""
 
+C:\analytics\projects\git\lexi\demos\venv\Scripts\python.exe
+
+import runpy ; temp = runpy._run_module_as_main("chrome_tools") 
+
+
+
 "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-allow-origins=* --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\ChromeDebugProfile"
 
 """
 
+import base64
+import contextlib
+import datetime
 import json
 import os
+import sys
+import pathlib
 import shutil
 import subprocess
 import threading
@@ -179,6 +190,28 @@ class ChromeLauncher:
         cls.sim_test_a()
         cls.sim_test_b()
         print("ChromeLauncher.sim_test passed")
+
+
+@contextlib.contextmanager
+def chrome_session(config: ChromeLaunchConfig | None = None):
+    """Context manager: launch Chrome, connect CDPClient, yield (launcher, client), then clean up.
+
+    Usage::
+
+        with chrome_session() as (launcher, client):
+            result = client.send("Browser.getVersion")
+    """
+    cfg = config or ChromeLaunchConfig()
+    launcher = ChromeLauncher(cfg)
+    launcher.start()
+    time.sleep(1)
+    client = CDPClient(host="localhost", port=cfg.remote_debugging_port)
+    client.connect()
+    try:
+        yield launcher, client
+    finally:
+        client.close()
+        launcher.stop()
 
 
 class ChromeHealth:
@@ -364,38 +397,29 @@ class CDPClient:
 
     @classmethod
     def sim_test(cls) -> None:
-        launcher = ChromeLauncher(ChromeLaunchConfig(delete_profile=True))
-        launcher.start()
-        time.sleep(1)
+        with chrome_session(ChromeLaunchConfig(delete_profile=True)) as (_, client):
+            # Browser.getVersion via browser-level send
+            result = client.send("Browser.getVersion")
+            print(f"  Browser product: {result.get('product')}")
+            assert result.get("product"), "Browser.getVersion must return product"
 
-        client = CDPClient()
-        client.connect()
+            # browser-level event subscription
+            received = []
+            client.subscribe("Target.targetCreated", lambda p: received.append(p))
+            client.send("Target.setDiscoverTargets", {"discover": True})
+            time.sleep(0.3)
+            print(f"  targetCreated events received: {len(received)}")
 
-        # Browser.getVersion via browser-level send
-        result = client.send("Browser.getVersion")
-        print(f"  Browser product: {result.get('product')}")
-        assert result.get("product"), "Browser.getVersion must return product"
+            # CDP error path
+            try:
+                client.send("ThisMethod.DoesNotExist")
+                assert False, "expected RuntimeError for unknown method"
+            except RuntimeError as e:
+                print(f"  error path: caught expected error: {e}")
 
-        # browser-level event subscription
-        received = []
-        client.subscribe("Target.targetCreated", lambda p: received.append(p))
-        client.send("Target.setDiscoverTargets", {"discover": True})
-        time.sleep(0.3)
-        print(f"  targetCreated events received: {len(received)}")
+            # CDPSession basic tests
+            CDPSession.sim_test(client)
 
-        # CDP error path
-        try:
-            client.send("ThisMethod.DoesNotExist")
-            assert False, "expected RuntimeError for unknown method"
-        except RuntimeError as e:
-            print(f"  error path: caught expected error: {e}")
-
-        # CDPSession basic tests
-        cls_session = CDPSession
-        cls_session.sim_test(client)
-
-        client.close()
-        launcher.stop()
         print("CDPClient.sim_test passed")
 
 
@@ -525,3 +549,543 @@ class CDPSession:
         print("  CDPSession: detached cleanly")
 
         print("CDPSession.sim_test passed")
+
+
+# ---------------------------------------------------------------------------
+# Safety
+# ---------------------------------------------------------------------------
+
+_DANGEROUS_WORDS = (
+    "submit", "complete", "finish", "finalize", "accept",
+    "start task", "delete", "discard", "leave page",
+)
+
+
+class BlockedActionError(Exception):
+    pass
+
+
+class SafetyPolicy:
+    def is_dangerous_text(self, text: str) -> bool:
+        t = text.lower()
+        return any(w in t for w in _DANGEROUS_WORDS)
+
+    def assert_safe_click(self, element: dict, allow_dangerous: bool = False) -> None:
+        if element.get("dangerous") and not allow_dangerous:
+            label = element.get("label") or element.get("text") or element.get("ref")
+            raise BlockedActionError(f"Dangerous click text: {label!r}")
+
+
+# ---------------------------------------------------------------------------
+# Element ref store
+# ---------------------------------------------------------------------------
+
+class StaleRefError(Exception):
+    def __init__(self, ref: str) -> None:
+        super().__init__(f"Ref {ref!r} not in current snapshot — take a new snapshot and retry.")
+        self.ref = ref
+
+
+class ElementRefStore:
+    def __init__(self) -> None:
+        self._refs: dict[str, dict] = {}
+
+    def rebuild(self, elements: list[dict]) -> None:
+        self._refs = {e["ref"]: e for e in elements}
+
+    def get(self, ref: str) -> dict | None:
+        return self._refs.get(ref)
+
+    def require(self, ref: str) -> dict:
+        el = self._refs.get(ref)
+        if el is None:
+            raise StaleRefError(ref)
+        return el
+
+    def all(self) -> list[dict]:
+        return list(self._refs.values())
+
+
+# ---------------------------------------------------------------------------
+# Action logger
+# ---------------------------------------------------------------------------
+
+class ActionLogger:
+    def __init__(self, log_path: str = "action_log.jsonl") -> None:
+        self._path = pathlib.Path(log_path)
+
+    def log(self, entry: dict) -> None:
+        entry.setdefault("ts", datetime.datetime.now().astimezone().isoformat())
+        with self._path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# DOM snapshot JavaScript
+# ---------------------------------------------------------------------------
+
+_SNAPSHOT_JS = r"""
+(function () {
+    document.querySelectorAll('[data-chrome-tools-ref]').forEach(function (el) {
+        el.removeAttribute('data-chrome-tools-ref');
+    });
+
+    var sel = [
+        'button', 'input', 'textarea', 'select', 'a[href]',
+        'summary', 'details', '[role="button"]', '[aria-expanded]',
+        '[contenteditable="true"]', 'input[type="file"]'
+    ].join(',');
+
+    var seen = new Set();
+    var elements = Array.from(document.querySelectorAll(sel)).filter(function (el) {
+        if (seen.has(el)) return false;
+        seen.add(el);
+        return true;
+    });
+
+    var dangerousWords = [
+        'submit', 'complete', 'finish', 'finalize', 'accept',
+        'start task', 'delete', 'discard', 'leave page'
+    ];
+
+    function getText(el) {
+        return (el.innerText || el.textContent || '').trim().slice(0, 200);
+    }
+
+    function getLabel(el) {
+        var al = el.getAttribute('aria-label');
+        if (al) return al.trim();
+        var lby = el.getAttribute('aria-labelledby');
+        if (lby) {
+            var lel = document.getElementById(lby);
+            if (lel) return lel.innerText.trim();
+        }
+        if (el.id) {
+            var lfor = document.querySelector('label[for="' + el.id + '"]');
+            if (lfor) return lfor.innerText.trim();
+        }
+        var parent = el.closest('label');
+        if (parent) {
+            var clone = parent.cloneNode(true);
+            clone.querySelectorAll('input,textarea,select,button').forEach(function (i) { i.remove(); });
+            return clone.innerText.trim();
+        }
+        if (el.placeholder) return el.placeholder;
+        if (el.title) return el.title;
+        return getText(el);
+    }
+
+    function isVisible(el) {
+        var rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return false;
+        var st = window.getComputedStyle(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+        return true;
+    }
+
+    function getKind(el) {
+        var tag = el.tagName;
+        var type = (el.type || '').toLowerCase();
+        var role = (el.getAttribute('role') || '').toLowerCase();
+        if (tag === 'INPUT' && type === 'file') return 'upload';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return 'field';
+        if (el.hasAttribute('contenteditable') && el.getAttribute('contenteditable') !== 'false') return 'field';
+        if (tag === 'BUTTON' || role === 'button') return 'button';
+        if (tag === 'A') return 'link';
+        if (tag === 'SUMMARY' || tag === 'DETAILS') return 'expandable';
+        if (el.hasAttribute('aria-expanded')) return 'expandable';
+        return 'control';
+    }
+
+    function isDangerous(el, label) {
+        var t = (label + ' ' + getText(el)).toLowerCase();
+        return dangerousWords.some(function (w) { return t.indexOf(w) !== -1; });
+    }
+
+    var records = [];
+    var refNum = 1;
+
+    elements.forEach(function (el) {
+        var ref = 'e' + refNum++;
+        el.setAttribute('data-chrome-tools-ref', ref);
+        var rect = el.getBoundingClientRect();
+        var tag = el.tagName;
+        var kind = getKind(el);
+        var label = getLabel(el);
+        var vp = '';
+        if (el.value !== undefined) {
+            vp = String(el.value).slice(0, 100);
+        } else if (kind === 'field') {
+            vp = (el.textContent || '').slice(0, 100);
+        }
+        records.push({
+            ref: ref,
+            kind: kind,
+            tag: tag,
+            role: el.getAttribute('role') || '',
+            id: el.id || '',
+            name: el.name || '',
+            type: (el.type || '').toLowerCase(),
+            label: label,
+            text: getText(el),
+            placeholder: el.placeholder || '',
+            value_preview: vp,
+            aria_label: el.getAttribute('aria-label') || '',
+            aria_expanded: el.getAttribute('aria-expanded'),
+            visible: isVisible(el),
+            enabled: !el.disabled,
+            dangerous: isDangerous(el, label),
+            rect: {x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)}
+        });
+    });
+
+    return records;
+})()
+"""
+
+
+# ---------------------------------------------------------------------------
+# PageController — Phase 1: read-only browser visibility
+# ---------------------------------------------------------------------------
+
+class PageController:
+    def __init__(self, session: CDPSession, logger: ActionLogger | None = None) -> None:
+        self.session = session
+        self.safety = SafetyPolicy()
+        self.refs = ElementRefStore()
+        self.logger = logger or ActionLogger()
+        self._snapshot_counter = 0
+
+    @classmethod
+    def attach_to_first_page(cls, client: CDPClient, logger: ActionLogger | None = None) -> "PageController":
+        result = client.send("Target.getTargets")
+        targets = result.get("targetInfos", [])
+        page = next((t for t in targets if t["type"] == "page"), None)
+        if page is None:
+            raise RuntimeError("No page targets found")
+        session = CDPSession(client)
+        session.attach(page["targetId"])
+        session.send("Runtime.enable")
+        return cls(session, logger)
+
+    def evaluate(self, expression: str) -> object:
+        result = self.session.send("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+        })
+        exc = result.get("exceptionDetails")
+        if exc:
+            desc = exc.get("exception", {}).get("description", str(exc))
+            raise RuntimeError(f"JS exception: {desc}")
+        return result.get("result", {}).get("value")
+
+    def _page_meta(self) -> dict:
+        return {
+            "title": self.evaluate("document.title"),
+            "url": self.evaluate("document.location.href"),
+            "viewport": {
+                "width": self.evaluate("window.innerWidth"),
+                "height": self.evaluate("window.innerHeight"),
+                "scroll_x": self.evaluate("Math.round(window.scrollX)"),
+                "scroll_y": self.evaluate("Math.round(window.scrollY)"),
+            },
+        }
+
+    def _run_snapshot_js(self) -> list[dict]:
+        result = self.session.send("Runtime.evaluate", {
+            "expression": _SNAPSHOT_JS,
+            "returnByValue": True,
+        })
+        exc = result.get("exceptionDetails")
+        if exc:
+            desc = exc.get("exception", {}).get("description", str(exc))
+            raise RuntimeError(f"Snapshot JS exception: {desc}")
+        return result.get("result", {}).get("value") or []
+
+    def observe_page(self) -> dict:
+        self._snapshot_counter += 1
+        snapshot_id = f"s{self._snapshot_counter}"
+        page = self._page_meta()
+        elements = self._run_snapshot_js()
+        self.refs.rebuild(elements)
+
+        visible_preview = self.evaluate(
+            "(function(){var t=document.body?document.body.innerText:'';return t.slice(0,200);})()"
+        )
+        full_length = self.evaluate(
+            "(function(){var t=document.body?document.body.innerText:'';return t.length;})()"
+        )
+        active_ref = self.evaluate(
+            "(function(){var el=document.activeElement;"
+            "return el?el.getAttribute('data-chrome-tools-ref'):null;})()"
+        )
+        active = self.refs.get(active_ref) if active_ref else None
+
+        controls = [e for e in elements if e["kind"] in ("button", "link", "control")]
+        fields = [e for e in elements if e["kind"] == "field"]
+        uploads = [e for e in elements if e["kind"] == "upload"]
+        expandables = [e for e in elements if e["kind"] == "expandable"]
+
+        return {
+            "snapshot_id": snapshot_id,
+            "page": page,
+            "text": {"visible_preview": visible_preview, "full_length": full_length},
+            "active": active,
+            "elements": elements,
+            "controls": controls,
+            "fields": fields,
+            "uploads": uploads,
+            "expandables": expandables,
+        }
+
+    def visible_text(self, max_chars: int = 12000) -> dict:
+        url = self.evaluate("document.location.href")
+        text = self.evaluate(
+            f"(function(){{var t=document.body?document.body.innerText:'';"
+            f"return t.slice(0,{max_chars});}})()"
+        )
+        return {"url": url, "visible_text": text}
+
+    def list_controls(self) -> list[dict]:
+        return [e for e in self.refs.all() if e["kind"] in ("button", "link", "control")]
+
+    def list_fields(self) -> list[dict]:
+        return [e for e in self.refs.all() if e["kind"] == "field"]
+
+    def list_uploads(self) -> list[dict]:
+        return [e for e in self.refs.all() if e["kind"] == "upload"]
+
+    def active_element(self) -> dict | None:
+        active_ref = self.evaluate(
+            "(function(){var el=document.activeElement;"
+            "return el?el.getAttribute('data-chrome-tools-ref'):null;})()"
+        )
+        return self.refs.get(active_ref) if active_ref else None
+
+    def screenshot(self, path: str | None = None) -> str:
+        result = self.session.send("Page.captureScreenshot", {"format": "png"})
+        data = result.get("data", "")
+        if path is None:
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = f"screenshot_{ts}.png"
+        p = pathlib.Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(base64.b64decode(data))
+        return str(p)
+
+    def save_state(self, output_dir: str | None = None) -> str:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if output_dir is None:
+            output_dir = str(pathlib.Path("browser_states") / ts)
+        d = pathlib.Path(output_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        snap = self.observe_page()
+        (d / "snapshot.json").write_text(json.dumps(snap, indent=2), encoding="utf-8")
+        vt = self.visible_text(max_chars=50000)
+        (d / "visible_text.txt").write_text(vt["visible_text"], encoding="utf-8")
+        self.screenshot(str(d / "screenshot.png"))
+        return str(d)
+
+    @classmethod
+    def sim_test(cls) -> None:
+        fixture_html = """<!DOCTYPE html>
+<html><body>
+<h1>Chrome Tools Fixture</h1>
+<button id="safe-button">Harmless button</button>
+<button id="submit-button">Submit</button>
+<label>GitHub URL<input id="repo-url" type="text" placeholder="Repository URL"></label>
+<label for="problem">Problem statement</label>
+<textarea id="problem"></textarea>
+<details><summary>Part 3: Verifier creation</summary>
+<p>Verifier instructions inside collapsed section.</p></details>
+<input id="upload" type="file" accept=".md">
+<div style="height:2000px"></div>
+<p id="bottom-text">Bottom marker for scroll test</p>
+</body></html>"""
+        fixture_b64 = base64.b64encode(fixture_html.encode()).decode()
+        fixture_url = f"data:text/html;base64,{fixture_b64}"
+
+        with chrome_session(ChromeLaunchConfig(delete_profile=True)) as (_, client):
+            pc = cls.attach_to_first_page(client)
+            waiter = _EventWaiter(pc.session, "Page.loadEventFired")
+            pc.session.send("Page.enable")
+            pc.session.send("Page.navigate", {"url": fixture_url})
+            waiter.wait(timeout=5)
+            time.sleep(0.3)
+
+            snap = pc.observe_page()
+            assert snap["page"]["url"].startswith("data:"), f"unexpected url: {snap['page']['url']}"
+            assert snap["text"]["full_length"] > 0, "expected non-empty page text"
+
+            refs_by_text = {e["text"]: e for e in snap["elements"]}
+
+            safe_btn = refs_by_text.get("Harmless button")
+            assert safe_btn is not None, "safe button not found"
+            assert not safe_btn["dangerous"], "safe button should not be dangerous"
+            print(f"  safe button ref={safe_btn['ref']} dangerous={safe_btn['dangerous']} (correct)")
+
+            submit_btn = refs_by_text.get("Submit")
+            assert submit_btn is not None, "submit button not found"
+            assert submit_btn["dangerous"], "submit button should be dangerous"
+            print(f"  submit button ref={submit_btn['ref']} dangerous={submit_btn['dangerous']} (correct)")
+
+            fields = pc.list_fields()
+            assert len(fields) >= 2, f"expected at least 2 fields, got {len(fields)}"
+            print(f"  fields: {[f['label'] for f in fields]}")
+
+            uploads = pc.list_uploads()
+            assert len(uploads) >= 1, f"expected at least 1 upload input, got {len(uploads)}"
+            print(f"  uploads: {len(uploads)} (correct)")
+
+            expandables = snap["expandables"]
+            assert len(expandables) >= 1, f"expected at least 1 expandable, got {len(expandables)}"
+            print(f"  expandables: {len(expandables)} (correct)")
+
+            vt = pc.visible_text()
+            assert "Chrome Tools Fixture" in vt["visible_text"], "fixture heading not in visible text"
+            print(f"  visible_text length={len(vt['visible_text'])}")
+
+            import tempfile, os as _os
+            with tempfile.TemporaryDirectory() as tmp:
+                saved = pc.save_state(tmp)
+                assert _os.path.exists(_os.path.join(saved, "snapshot.json")), "snapshot.json missing"
+                assert _os.path.exists(_os.path.join(saved, "screenshot.png")), "screenshot.png missing"
+                assert _os.path.exists(_os.path.join(saved, "visible_text.txt")), "visible_text.txt missing"
+                print(f"  save_state: {saved} (snapshot.json, screenshot.png, visible_text.txt present)")
+
+        print("PageController.sim_test passed")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class BrowserToolCLI:
+    def __init__(self, host: str = "localhost", port: int = 9222) -> None:
+        self._host = host
+        self._port = port
+
+    def _ok(self, command: str, data: dict | None = None, message: str = "") -> dict:
+        return {"ok": True, "command": command, "message": message, "data": data or {}, "warnings": []}
+
+    def _err(self, command: str, reason: str, message: str, data: dict | None = None) -> dict:
+        return {"ok": False, "blocked": False, "command": command, "reason": reason,
+                "message": message, "data": data or {}, "warnings": []}
+
+    def _connect_pc(self) -> tuple[CDPClient, PageController]:
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        pc = PageController.attach_to_first_page(client)
+        return client, pc
+
+    def _run_with_pc(self, cmd: str, fn) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err(cmd, "chrome_not_running",
+                             f"Chrome CDP endpoint not reachable on {self._host}:{self._port}.")
+        try:
+            client, pc = self._connect_pc()
+            try:
+                return fn(pc)
+            finally:
+                client.close()
+        except Exception as exc:
+            return self._err(cmd, "error", str(exc))
+
+    def run(self, args: list[str]) -> dict:
+        if not args:
+            return self._err("help", "no_command", "Provide a command. See README for usage.")
+        cmd = args[0]
+
+        if cmd == "status":
+            return self._cmd_status()
+        if cmd == "pages":
+            return self._cmd_pages()
+        if cmd == "snapshot":
+            return self._run_with_pc(cmd, lambda pc: self._ok(cmd, pc.observe_page(), "Snapshot captured."))
+        if cmd == "visible-text":
+            max_chars = int(args[1]) if len(args) > 1 else 12000
+            return self._run_with_pc(cmd, lambda pc: self._ok(cmd, pc.visible_text(max_chars), "Visible text retrieved."))
+        if cmd == "list-controls":
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"controls": pc.list_controls()}, f"{len(pc.list_controls())} control(s)."))[1])
+        if cmd == "list-fields":
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"fields": pc.list_fields()}, f"{len(pc.list_fields())} field(s)."))[1])
+        if cmd == "list-uploads":
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"uploads": pc.list_uploads()}, f"{len(pc.list_uploads())} upload(s)."))[1])
+        if cmd == "active-element":
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"active": pc.active_element()}, "Active element retrieved."))[1])
+        if cmd == "screenshot":
+            path = args[1] if len(args) > 1 else None
+            return self._run_with_pc(cmd, lambda pc: self._ok(cmd, {"path": pc.screenshot(path)}, "Screenshot saved."))
+        if cmd == "save-state":
+            out = args[1] if len(args) > 1 else None
+            return self._run_with_pc(cmd, lambda pc: self._ok(cmd, {"output_dir": pc.save_state(out)}, "State saved."))
+
+        return self._err(cmd, "unknown_command", f"Unknown command: {cmd!r}")
+
+    def _cmd_status(self) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("status", "chrome_not_running",
+                             f"Chrome CDP endpoint not reachable on {self._host}:{self._port}.")
+        info = health.version_info() or {}
+        return self._ok("status", {
+            "chrome_running": True,
+            "cdp_port": self._port,
+            "browser": info.get("Browser", ""),
+        }, "Chrome is running.")
+
+    def _cmd_pages(self) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("pages", "chrome_not_running", "Chrome is not running.")
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        try:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            pages = [
+                {"index": i, "target_id": t["targetId"], "type": t["type"],
+                 "title": t.get("title", ""), "url": t.get("url", "")}
+                for i, t in enumerate(targets) if t["type"] == "page"
+            ]
+            return self._ok("pages", {"pages": pages}, f"{len(pages)} page(s) found.")
+        finally:
+            client.close()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+_log = lambda msg: print(msg, file=_sys.stderr)
+
+
+def safe_local_imports(g: dict) -> None:
+    try:
+        pass  # all deps loaded via _get_versholn() inside functions
+    except Exception:
+        import traceback as _tb
+        _log(f"FATAL: safe_local_imports failed:\n{_tb.format_exc()}")
+        raise
+
+
+def main() -> int:
+    args = _sys.argv[1:]
+    cli = BrowserToolCLI()
+    result = cli.run(args)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    safe_local_imports(globals())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        _log(f"FATAL unhandled exception:\n{traceback.format_exc()}")
+        raise
