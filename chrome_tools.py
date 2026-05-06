@@ -338,7 +338,11 @@ class CDPClient:
 
     def close(self) -> None:
         if self.ws:
-            self.ws.close()
+            if not self.closed.is_set():
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
             self.ws = None
 
     def send(self, method: str, params: dict | None = None, session_id: str | None = None) -> dict:
@@ -1411,12 +1415,13 @@ class _ReplSession:
 
     def _alive(self) -> bool:
         """Return True if the current client connection is still healthy."""
-        if self._client is None:
+        if self._client is None or self._client.closed.is_set():
+            print(f"_alive:Falsex")
             return False
-        if self._client.closed.is_set():
-            return False
-        health = ChromeHealth(port=self._config.remote_debugging_port)
-        return health.is_alive()
+        # proc.poll() is a free syscall — no HTTP round-trip needed
+        ret = self._launcher is not None and self._launcher.status() == "running"
+        print(f"_alive:{ret}")
+        return ret
 
     def _teardown(self) -> None:
         if self._client is not None:
@@ -1444,7 +1449,7 @@ class _ReplSession:
         self._pc = PageController.attach_to_first_page(self._client)
         _log(f"REPL: Chrome ready on port {self._config.remote_debugging_port}")
 
-    def get(self) -> "PageController":
+    def get_page_controller(self) -> "PageController":
         """Return a healthy PageController, restarting Chrome if needed."""
         if not self._alive():
             _log("REPL: Chrome not alive — restarting session...")
@@ -1507,5 +1512,6 @@ if __name__ == "__main__":
         # REPL mode — invoked via:
         #   import runpy ; temp = runpy._run_module_as_main("chrome_tools")
         # Chrome stays alive between re-runs. Edit the command below and re-run.
-        _pc = _ReplSession.get_singleton().get()
-        print(json.dumps(_pc.observe_page(), indent=2))
+        _ss = _ReplSession.get_singleton()
+        _pc = _ss.get_page_controller()
+        #print(json.dumps(_pc.observe_page(), indent=2))
