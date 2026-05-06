@@ -1455,42 +1455,20 @@ class _ReplSession:
     def client(self) -> CDPClient | None:
         return self._client
 
+    @classmethod
+    def get_singleton(cls, config: "ChromeLaunchConfig | None" = None) -> "_ReplSession":
+        """Return the persistent session stored in __main__ globals().
 
-# Module-level singleton — survives between runpy re-runs within the same process.
-_repl: _ReplSession | None = None
-
-
-def repl_session(config: ChromeLaunchConfig | None = None) -> _ReplSession:
-    """Return the module-level REPL session, creating it on first call."""
-    global _repl
-    if _repl is None:
-        _repl = _ReplSession(config)
-    return _repl
-
-
-def repl_run(args: list[str]) -> None:
-    """Run a CLI command against the persistent REPL session and print JSON output."""
-    session = repl_session()
-    pc = session.get()
-
-    # Patch a one-shot BrowserToolCLI that reuses the existing PageController
-    # rather than opening a new CDPClient per command.
-    class _ReplCLI(BrowserToolCLI):
-        def _run_with_pc(self, cmd: str, fn) -> dict:
-            try:
-                return fn(pc)
-            except StaleRefError as exc:
-                _log(f"REPL: stale ref {exc.ref!r} — re-snapshotting...")
-                pc.observe_page()
-                try:
-                    return fn(pc)
-                except Exception as exc2:
-                    return self._err(cmd, "error", str(exc2))
-            except Exception as exc:
-                return self._err(cmd, "error", str(exc))
-
-    result = _ReplCLI().run(args)
-    print(json.dumps(result, indent=2))
+        runpy._run_module_as_main re-executes the module into
+        sys.modules['__main__'].__dict__ without clearing it, so any key
+        written there survives between re-runs in the same process.
+        """
+        g = sys.modules["__main__"].__dict__
+        session = g.get("_repl")
+        if not isinstance(session, cls):
+            session = cls(config)
+            g["_repl"] = session
+        return session
 
 
 # ---------------------------------------------------------------------------
@@ -1533,4 +1511,5 @@ if __name__ == "__main__":
         # REPL mode — invoked via:
         #   import runpy ; temp = runpy._run_module_as_main("chrome_tools")
         # Chrome stays alive between re-runs. Edit the command below and re-run.
-        repl_run(["snapshot"])
+        _pc = _ReplSession.get_singleton().get()
+        print(json.dumps(_pc.observe_page(), indent=2))
