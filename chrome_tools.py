@@ -1393,6 +1393,107 @@ class BrowserToolCLI:
 
 
 # ---------------------------------------------------------------------------
+# REPL session — persistent Chrome kept alive between runpy re-runs
+# ---------------------------------------------------------------------------
+
+class _ReplSession:
+    """Holds a Chrome launcher + CDPClient + PageController for reuse across runpy runs.
+
+    Call `get()` to obtain a healthy session; it will restart Chrome and
+    reconnect automatically if the previous instance died.
+    """
+
+    def __init__(self, config: ChromeLaunchConfig | None = None) -> None:
+        self._config = config or ChromeLaunchConfig()
+        self._launcher: ChromeLauncher | None = None
+        self._client: CDPClient | None = None
+        self._pc: PageController | None = None
+
+    def _alive(self) -> bool:
+        """Return True if the current client connection is still healthy."""
+        if self._client is None:
+            return False
+        if self._client.closed.is_set():
+            return False
+        health = ChromeHealth(port=self._config.remote_debugging_port)
+        return health.is_alive()
+
+    def _teardown(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+        if self._launcher is not None:
+            try:
+                self._launcher.stop()
+            except Exception:
+                pass
+            self._launcher = None
+        self._pc = None
+
+    def _start(self) -> None:
+        self._teardown()
+        _log("REPL: starting Chrome...")
+        self._launcher = ChromeLauncher(self._config)
+        self._launcher.start()
+        time.sleep(1)
+        self._client = CDPClient(port=self._config.remote_debugging_port)
+        self._client.connect()
+        self._pc = PageController.attach_to_first_page(self._client)
+        _log(f"REPL: Chrome ready on port {self._config.remote_debugging_port}")
+
+    def get(self) -> "PageController":
+        """Return a healthy PageController, restarting Chrome if needed."""
+        if not self._alive():
+            _log("REPL: Chrome not alive — restarting session...")
+            self._start()
+        return self._pc
+
+    @property
+    def client(self) -> CDPClient | None:
+        return self._client
+
+
+# Module-level singleton — survives between runpy re-runs within the same process.
+_repl: _ReplSession | None = None
+
+
+def repl_session(config: ChromeLaunchConfig | None = None) -> _ReplSession:
+    """Return the module-level REPL session, creating it on first call."""
+    global _repl
+    if _repl is None:
+        _repl = _ReplSession(config)
+    return _repl
+
+
+def repl_run(args: list[str]) -> None:
+    """Run a CLI command against the persistent REPL session and print JSON output."""
+    session = repl_session()
+    pc = session.get()
+
+    # Patch a one-shot BrowserToolCLI that reuses the existing PageController
+    # rather than opening a new CDPClient per command.
+    class _ReplCLI(BrowserToolCLI):
+        def _run_with_pc(self, cmd: str, fn) -> dict:
+            try:
+                return fn(pc)
+            except StaleRefError as exc:
+                _log(f"REPL: stale ref {exc.ref!r} — re-snapshotting...")
+                pc.observe_page()
+                try:
+                    return fn(pc)
+                except Exception as exc2:
+                    return self._err(cmd, "error", str(exc2))
+            except Exception as exc:
+                return self._err(cmd, "error", str(exc))
+
+    result = _ReplCLI().run(args)
+    print(json.dumps(result, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1418,11 +1519,18 @@ def main() -> int:
 
 if __name__ == "__main__":
     safe_local_imports(globals())
-    try:
-        raise SystemExit(main())
-    except SystemExit:
-        raise
-    except Exception:
-        import traceback
-        _log(f"FATAL unhandled exception:\n{traceback.format_exc()}")
-        raise
+
+    if len(sys.argv) > 1:
+        try:
+            raise SystemExit(main())
+        except SystemExit:
+            raise
+        except Exception:
+            import traceback
+            _log(f"FATAL unhandled exception:\n{traceback.format_exc()}")
+            raise
+    else:
+        # REPL mode — invoked via:
+        #   import runpy ; temp = runpy._run_module_as_main("chrome_tools")
+        # Chrome stays alive between re-runs. Edit the command below and re-run.
+        repl_run(["snapshot"])
