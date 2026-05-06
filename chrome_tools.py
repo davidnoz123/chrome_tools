@@ -1401,75 +1401,93 @@ class BrowserToolCLI:
 # ---------------------------------------------------------------------------
 
 class _ReplSession:
-    """Holds a Chrome launcher + CDPClient + PageController for reuse across runpy runs.
+    """Singleton class — no instances. All state lives in globals()['_repl_state'].
 
-    Call `get()` to obtain a healthy session; it will restart Chrome and
-    reconnect automatically if the previous instance died.
+    Class-level variables would reset on every runpy re-run (the class is
+    redefined each time), so state is stored in globals() which persists across
+    re-runs in the same process.
+
+    Usage:
+        _pc = _ReplSession.get_page_controller()
     """
 
-    def __init__(self, config: ChromeLaunchConfig | None = None) -> None:
-        self._config = config or ChromeLaunchConfig()
-        self._launcher: ChromeLauncher | None = None
-        self._client: CDPClient | None = None
-        self._pc: PageController | None = None
-
-    def _alive(self) -> bool:
-        """Return True if the current client connection is still healthy."""
-        if self._client is None or self._client.closed.is_set():
-            print(f"_alive:Falsex")
-            return False
-        # proc.poll() is a free syscall — no HTTP round-trip needed
-        ret = self._launcher is not None and self._launcher.status() == "running"
-        print(f"_alive:{ret}")
-        return ret
-
-    def _teardown(self) -> None:
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                pass
-            self._client = None
-        if self._launcher is not None:
-            try:
-                self._launcher.stop()
-            except Exception:
-                pass
-            self._launcher = None
-        self._pc = None
-
-    def _start(self) -> None:
-        self._teardown()
-        _log("REPL: starting Chrome...")
-        self._launcher = ChromeLauncher(self._config)
-        self._launcher.start()
-        time.sleep(1)
-        self._client = CDPClient(port=self._config.remote_debugging_port)
-        self._client.connect()
-        self._pc = PageController.attach_to_first_page(self._client)
-        _log(f"REPL: Chrome ready on port {self._config.remote_debugging_port}")
-
-    def get_page_controller(self) -> "PageController":
-        """Return a healthy PageController, restarting Chrome if needed."""
-        if not self._alive():
-            _log("REPL: Chrome not alive — restarting session...")
-            self._start()
-        return self._pc
-
-    @property
-    def client(self) -> CDPClient | None:
-        return self._client
+    _STATE_KEY = "_repl_state"
 
     @classmethod
-    def get_singleton(cls, config: "ChromeLaunchConfig | None" = None) -> "_ReplSession":
-        """Return the persistent session stored in globals().
+    def _state(cls) -> dict:
+        """Return the persistent state dict, creating it on first access."""
+        if cls._STATE_KEY not in globals():
+            globals()[cls._STATE_KEY] = {
+                "config": None,
+                "launcher": None,
+                "client": None,
+                "pc": None,
+            }
+        return globals()[cls._STATE_KEY]
 
-        runpy._run_module_as_main re-executes the module into __main__'s globals()
-        without clearing it, so any key written there survives between re-runs.
+    @classmethod
+    def _alive(cls) -> bool:
+        """Return True if the current client connection is still healthy."""
+        s = cls._state()
+        client = s["client"]
+        if client is None or client.closed.is_set():
+            return False
+        # proc.poll() is a free syscall — no HTTP round-trip needed
+        return s["launcher"] is not None and s["launcher"].status() == "running"
+
+    @classmethod
+    def _teardown(cls) -> None:
+        s = cls._state()
+        c = s["client"]; s["client"] = None        
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+        if s["launcher"] is not None:
+            try:
+                s["launcher"].stop()
+            except Exception:
+                pass
+            s["launcher"] = None
+        s["pc"] = None
+
+    @classmethod
+    def _start(cls) -> None:
+        s = cls._state()
+        cls._teardown()
+        config = s["config"] or ChromeLaunchConfig()
+        _log("REPL: starting Chrome...")
+        s["launcher"] = ChromeLauncher(config)
+        s["launcher"].start()
+        time.sleep(1)
+        s["client"] = CDPClient(port=config.remote_debugging_port)
+        s["client"].connect()
+        s["pc"] = PageController.attach_to_first_page(s["client"])
+        _log(f"REPL: Chrome ready on port {config.remote_debugging_port}")
+
+    @classmethod
+    def get_page_controller(cls, config: "ChromeLaunchConfig | None" = None) -> "PageController":
+        """Return a healthy PageController, restarting Chrome if needed.
+
+        Pass config on first call (or to reconfigure). Subsequent calls reuse
+        the running session unless Chrome has died.
         """
-        if "_repl" not in globals():
-            globals()["_repl"] = cls(config)
-        return globals()["_repl"]
+        if config is not None:
+            cls._state()["config"] = config
+        if not cls._alive():
+            _log("REPL: Chrome not alive — restarting session...")
+            cls._start()
+        return cls._state()["pc"]
+
+    @classmethod
+    def get_client(cls) -> "CDPClient | None":
+        return cls._state()["client"]
+
+    @classmethod
+    def teardown(cls) -> None:
+        """Explicitly stop Chrome and clean up."""
+        cls._teardown()
 
 
 # ---------------------------------------------------------------------------
