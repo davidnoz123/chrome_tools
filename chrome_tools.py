@@ -611,11 +611,12 @@ class ElementRefStore:
 # ---------------------------------------------------------------------------
 
 class ActionLogger:
-    def __init__(self, log_path: str = "action_log.jsonl") -> None:
+    def __init__(self, log_path: str = "browser_states/action_log.jsonl") -> None:
         self._path = pathlib.Path(log_path)
 
     def log(self, entry: dict) -> None:
         entry.setdefault("ts", datetime.datetime.now().astimezone().isoformat())
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
@@ -855,6 +856,9 @@ class PageController:
     def list_uploads(self) -> list[dict]:
         return [e for e in self.refs.all() if e["kind"] == "upload"]
 
+    def list_expandables(self) -> list[dict]:
+        return [e for e in self.refs.all() if e["kind"] == "expandable"]
+
     def active_element(self) -> dict | None:
         active_ref = self.evaluate(
             "(function(){var el=document.activeElement;"
@@ -886,12 +890,211 @@ class PageController:
         self.screenshot(str(d / "screenshot.png"))
         return str(d)
 
+    # ------------------------------------------------------------------
+    # Phase 2: safe ref actions
+    # ------------------------------------------------------------------
+
+    def scroll_to_text(self, text: str) -> dict:
+        """Find text in the page and scroll it into view. Returns {found: bool}."""
+        expr = (
+            "(function(needle) {"
+            "  function walk(node) {"
+            "    if (node.nodeType === 3) {"
+            "      if (node.nodeValue && node.nodeValue.indexOf(needle) !== -1) {"
+            "        var p = node.parentElement;"
+            "        if (p) { p.scrollIntoView({block:'center',behavior:'instant'}); return p; }"
+            "      }"
+            "    }"
+            "    for (var i=0; i<node.childNodes.length; i++) {"
+            "      var r = walk(node.childNodes[i]);"
+            "      if (r) return r;"
+            "    }"
+            "    return null;"
+            "  }"
+            "  var found = walk(document.body);"
+            "  return found ? true : false;"
+            "})(" + json.dumps(text) + ")"
+        )
+        found = self.evaluate(expr)
+        self.logger.log({"action": "scroll_to_text", "text": text, "found": found})
+        return {"found": bool(found)}
+
+    def scroll_ref_into_view(self, ref: str) -> None:
+        """Scroll element ref into view."""
+        self.refs.require(ref)
+        self.evaluate(
+            f"(function(){{"
+            f"  var el = document.querySelector('[data-chrome-tools-ref={json.dumps(ref)}]');"
+            f"  if (el) el.scrollIntoView({{block:'center',behavior:'instant'}});"
+            f"}})()"
+        )
+        self.logger.log({"action": "scroll_ref_into_view", "ref": ref})
+
+    def click_ref(self, ref: str, allow_dangerous: bool = False) -> dict:
+        """Click element by ref. Blocked if element is dangerous (unless allow_dangerous=True)."""
+        element = self.refs.require(ref)
+        try:
+            self.safety.assert_safe_click(element, allow_dangerous=allow_dangerous)
+        except BlockedActionError as exc:
+            entry = {
+                "action": "click_ref", "ref": ref,
+                "element": {k: element.get(k) for k in ("ref", "kind", "label", "text", "dangerous")},
+                "blocked": True, "reason": str(exc),
+            }
+            self.logger.log(entry)
+            return {"blocked": True, "reason": str(exc)}
+        self.scroll_ref_into_view(ref)
+        self.evaluate(
+            f"(function(){{"
+            f"  var el = document.querySelector('[data-chrome-tools-ref={json.dumps(ref)}]');"
+            f"  if (el) el.click();"
+            f"}})()"
+        )
+        url = self.evaluate("document.location.href")
+        title = self.evaluate("document.title")
+        scr_path = self.screenshot()
+        entry = {
+            "action": "click_ref", "ref": ref,
+            "element": {k: element.get(k) for k in ("ref", "kind", "label", "text", "dangerous")},
+            "url": url, "title": title, "screenshot": scr_path,
+        }
+        self.logger.log(entry)
+        return {"ok": True, "screenshot": scr_path}
+
+    def focus_ref(self, ref: str) -> None:
+        """Focus element by ref."""
+        self.refs.require(ref)
+        self.evaluate(
+            f"(function(){{"
+            f"  var el = document.querySelector('[data-chrome-tools-ref={json.dumps(ref)}]');"
+            f"  if (el) el.focus();"
+            f"}})()"
+        )
+        self.logger.log({"action": "focus_ref", "ref": ref})
+
+    def fill_ref(self, ref: str, text: str) -> dict:
+        """Fill field by ref. If text ends in a known extension, read file contents instead."""
+        element = self.refs.require(ref)
+        fill_value = text
+        # treat as file path if it looks like one
+        known_text_exts = (".md", ".txt", ".rst", ".csv", ".json", ".html", ".xml")
+        if any(text.lower().endswith(ext) for ext in known_text_exts):
+            p = pathlib.Path(text)
+            if p.exists():
+                fill_value = p.read_text(encoding="utf-8")
+
+        old_preview = element.get("value_preview", "")
+        new_preview = fill_value[:100]
+
+        # React-compatible native setter + dispatch input + change events
+        js = (
+            "(function(ref, val) {"
+            "  var el = document.querySelector('[data-chrome-tools-ref=' + JSON.stringify(ref) + ']');"
+            "  if (!el) return false;"
+            "  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {"
+            "    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');"
+            "    var nativeTextAreaSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');"
+            "    var setter = el.tagName === 'TEXTAREA' ? (nativeTextAreaSetter && nativeTextAreaSetter.set) : (nativeInputValueSetter && nativeInputValueSetter.set);"
+            "    if (setter) { setter.call(el, val); }"
+            "    else { el.value = val; }"
+            "  } else if (el.isContentEditable) {"
+            "    el.textContent = val;"
+            "  } else {"
+            "    el.value = val;"
+            "  }"
+            "  el.dispatchEvent(new Event('input', {bubbles: true}));"
+            "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+            "  return true;"
+            "})(" + json.dumps(ref) + ", " + json.dumps(fill_value) + ")"
+        )
+        ok = self.evaluate(js)
+        url = self.evaluate("document.location.href")
+        title = self.evaluate("document.title")
+        scr_path = self.screenshot()
+        entry = {
+            "action": "fill_ref", "ref": ref,
+            "element": {k: element.get(k) for k in ("ref", "kind", "label", "type")},
+            "old_value_preview": old_preview, "new_value_preview": new_preview,
+            "url": url, "title": title, "screenshot": scr_path,
+        }
+        self.logger.log(entry)
+        return {"ok": bool(ok), "screenshot": scr_path}
+
+    def paste_text(self, text: str) -> dict:
+        """Insert text into the currently active/focused element."""
+        js = (
+            "(function(val) {"
+            "  var el = document.activeElement;"
+            "  if (!el) return false;"
+            "  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {"
+            "    var start = el.selectionStart; var end = el.selectionEnd;"
+            "    var old = el.value;"
+            "    el.value = old.slice(0, start) + val + old.slice(end);"
+            "    el.selectionStart = el.selectionEnd = start + val.length;"
+            "  } else if (el.isContentEditable) {"
+            "    document.execCommand('insertText', false, val);"
+            "  } else { return false; }"
+            "  el.dispatchEvent(new Event('input', {bubbles: true}));"
+            "  el.dispatchEvent(new Event('change', {bubbles: true}));"
+            "  return true;"
+            "})(" + json.dumps(text) + ")"
+        )
+        ok = self.evaluate(js)
+        url = self.evaluate("document.location.href")
+        scr_path = self.screenshot()
+        self.logger.log({"action": "paste_text", "text_preview": text[:100], "url": url, "screenshot": scr_path})
+        return {"ok": bool(ok), "screenshot": scr_path}
+
+    # ------------------------------------------------------------------
+    # Phase 3: file upload
+    # ------------------------------------------------------------------
+
+    def upload_file_ref(self, ref: str, path: str) -> dict:
+        """Upload a file to a file input ref using CDP DOM.setFileInputFiles."""
+        element = self.refs.require(ref)
+        if element.get("kind") != "upload":
+            raise ValueError(f"Ref {ref!r} is not a file input (kind={element.get('kind')!r})")
+        p = pathlib.Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Upload file not found: {path!r}")
+        abs_path = str(p.resolve())
+        # Resolve DOM node id
+        expr = (
+            "document.querySelector('[data-chrome-tools-ref=' + JSON.stringify("
+            + json.dumps(ref) + ") + ']')"
+        )
+        node_result = self.session.send("DOM.getDocument", {"depth": 0})
+        root_id = node_result.get("root", {}).get("nodeId")
+        search_result = self.session.send("DOM.querySelector", {
+            "nodeId": root_id,
+            "selector": f"[data-chrome-tools-ref={json.dumps(ref)}]",
+        })
+        node_id = search_result.get("nodeId")
+        if not node_id:
+            raise RuntimeError(f"Could not resolve DOM node for ref {ref!r}")
+        self.session.send("DOM.setFileInputFiles", {
+            "files": [abs_path],
+            "nodeId": node_id,
+        })
+        snap = self.observe_page()
+        scr_path = self.screenshot()
+        url = snap["page"]["url"]
+        title = snap["page"]["title"]
+        entry = {
+            "action": "upload_file_ref", "ref": ref,
+            "element": {k: element.get(k) for k in ("ref", "kind", "label")},
+            "file": abs_path, "url": url, "title": title, "screenshot": scr_path,
+        }
+        self.logger.log(entry)
+        return {"ok": True, "file": abs_path, "screenshot": scr_path}
+
     @classmethod
     def sim_test(cls) -> None:
         fixture_html = """<!DOCTYPE html>
 <html><body>
 <h1>Chrome Tools Fixture</h1>
-<button id="safe-button">Harmless button</button>
+<button id="safe-button" onclick="document.getElementById('click-result').textContent='clicked'">Harmless button</button>
+<p id="click-result"></p>
 <button id="submit-button">Submit</button>
 <label>GitHub URL<input id="repo-url" type="text" placeholder="Repository URL"></label>
 <label for="problem">Problem statement</label>
@@ -945,13 +1148,74 @@ class PageController:
             assert "Chrome Tools Fixture" in vt["visible_text"], "fixture heading not in visible text"
             print(f"  visible_text length={len(vt['visible_text'])}")
 
+            # Expandables (list_expandables)
+            exp = pc.list_expandables()
+            assert len(exp) >= 1, f"expected at least 1 expandable, got {len(exp)}"
+            print(f"  list_expandables: {len(exp)} (correct)")
+
             import tempfile, os as _os
             with tempfile.TemporaryDirectory() as tmp:
+                # Use ActionLogger pointing into tmp
+                pc.logger = ActionLogger(str(pathlib.Path(tmp) / "action_log.jsonl"))
+
                 saved = pc.save_state(tmp)
                 assert _os.path.exists(_os.path.join(saved, "snapshot.json")), "snapshot.json missing"
                 assert _os.path.exists(_os.path.join(saved, "screenshot.png")), "screenshot.png missing"
                 assert _os.path.exists(_os.path.join(saved, "visible_text.txt")), "visible_text.txt missing"
                 print(f"  save_state: {saved} (snapshot.json, screenshot.png, visible_text.txt present)")
+
+                # Re-snapshot so refs are fresh
+                pc.observe_page()
+
+                # click harmless button
+                safe_ref = next(e["ref"] for e in pc.refs.all() if e.get("text") == "Harmless button")
+                result = pc.click_ref(safe_ref)
+                assert result.get("ok"), f"harmless click failed: {result}"
+                time.sleep(0.2)
+                click_result_text = pc.evaluate("document.getElementById('click-result').textContent")
+                assert click_result_text == "clicked", f"harmless button onclick did not fire, got: {click_result_text!r}"
+                print(f"  click_ref (harmless): ok, onclick fired (correct)")
+
+                # blocked Submit click
+                submit_ref = next(e["ref"] for e in pc.refs.all() if e.get("text") == "Submit")
+                blocked = pc.click_ref(submit_ref)
+                assert blocked.get("blocked"), f"expected blocked for Submit, got: {blocked}"
+                print(f"  click_ref (Submit): blocked={blocked['blocked']} reason={blocked['reason']!r} (correct)")
+
+                # fill input
+                pc.observe_page()
+                input_ref = next(e["ref"] for e in pc.refs.all() if e.get("id") == "repo-url" or (e.get("kind") == "field" and e.get("type") == "text"))
+                fill_result = pc.fill_ref(input_ref, "https://example.com/repo")
+                assert fill_result.get("ok"), f"fill_ref failed: {fill_result}"
+                val = pc.evaluate("document.getElementById('repo-url').value")
+                assert val == "https://example.com/repo", f"fill_ref value mismatch: {val!r}"
+                print(f"  fill_ref (input): ok, value={val!r} (correct)")
+
+                # fill textarea
+                ta_ref = next(e["ref"] for e in pc.refs.all() if e.get("tag") == "TEXTAREA")
+                fill_ta = pc.fill_ref(ta_ref, "Problem text here.")
+                assert fill_ta.get("ok"), f"fill_ref textarea failed: {fill_ta}"
+                ta_val = pc.evaluate("document.getElementById('problem').value")
+                assert ta_val == "Problem text here.", f"textarea fill mismatch: {ta_val!r}"
+                print(f"  fill_ref (textarea): ok, value={ta_val!r} (correct)")
+
+                # scroll_to_text
+                scroll_result = pc.scroll_to_text("Bottom marker for scroll test")
+                assert scroll_result["found"], "scroll_to_text should find bottom marker"
+                print(f"  scroll_to_text: found={scroll_result['found']} (correct)")
+
+                missing_scroll = pc.scroll_to_text("__text_that_does_not_exist_xyz__")
+                assert not missing_scroll["found"], "scroll_to_text should not find missing text"
+                print(f"  scroll_to_text (missing): found={missing_scroll['found']} (correct)")
+
+                # action_log.jsonl written
+                log_path = _os.path.join(tmp, "action_log.jsonl")
+                assert _os.path.exists(log_path), f"action_log.jsonl not found at {log_path}"
+                with open(log_path, encoding="utf-8") as f:
+                    lines = [l for l in f if l.strip()]
+                assert len(lines) >= 4, f"expected at least 4 log entries, got {len(lines)}"
+                actions = [json.loads(l)["action"] for l in lines]
+                print(f"  action_log.jsonl: {len(lines)} entries, actions={actions}")
 
         print("PageController.sim_test passed")
 
@@ -1020,6 +1284,80 @@ class BrowserToolCLI:
         if cmd == "save-state":
             out = args[1] if len(args) > 1 else None
             return self._run_with_pc(cmd, lambda pc: self._ok(cmd, {"output_dir": pc.save_state(out)}, "State saved."))
+        if cmd == "list-expandables":
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"expandables": pc.list_expandables()}, f"{len(pc.list_expandables())} expandable(s)."))[1])
+        if cmd == "find-text":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: find-text <text>")
+            text = args[1]
+            return self._run_with_pc(cmd, lambda pc: self._ok(cmd, pc.scroll_to_text(text), f"Find-text completed."))
+        if cmd == "scroll-to-text":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: scroll-to-text <text>")
+            text = args[1]
+            return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, pc.scroll_to_text(text), "Scrolled."))[1])
+        if cmd == "scroll-ref":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: scroll-ref <ref>")
+            ref = args[1]
+            def _scroll_ref(pc):
+                pc.observe_page()
+                pc.scroll_ref_into_view(ref)
+                return self._ok(cmd, {"ref": ref}, "Scrolled ref into view.")
+            return self._run_with_pc(cmd, _scroll_ref)
+        if cmd == "click-ref":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: click-ref <ref> [--allow-dangerous]")
+            ref = args[1]
+            allow_dangerous = "--allow-dangerous" in args
+            def _click(pc):
+                pc.observe_page()
+                result = pc.click_ref(ref, allow_dangerous=allow_dangerous)
+                if result.get("blocked"):
+                    r = self._ok(cmd, result, "Action blocked.")
+                    r["blocked"] = True
+                    r["reason"] = result.get("reason", "")
+                    return r
+                return self._ok(cmd, result, "Clicked.")
+            return self._run_with_pc(cmd, _click)
+        if cmd == "focus-ref":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: focus-ref <ref>")
+            ref = args[1]
+            def _focus(pc):
+                pc.observe_page()
+                pc.focus_ref(ref)
+                return self._ok(cmd, {"ref": ref}, "Focused.")
+            return self._run_with_pc(cmd, _focus)
+        if cmd == "fill-ref":
+            if len(args) < 3:
+                return self._err(cmd, "missing_arg", "Usage: fill-ref <ref> <text_or_file>")
+            ref = args[1]
+            text = args[2]
+            def _fill(pc):
+                pc.observe_page()
+                result = pc.fill_ref(ref, text)
+                return self._ok(cmd, result, "Filled.")
+            return self._run_with_pc(cmd, _fill)
+        if cmd == "paste-text":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: paste-text <text>")
+            text = args[1]
+            def _paste(pc):
+                pc.observe_page()
+                result = pc.paste_text(text)
+                return self._ok(cmd, result, "Pasted.")
+            return self._run_with_pc(cmd, _paste)
+        if cmd == "upload-file-ref":
+            if len(args) < 3:
+                return self._err(cmd, "missing_arg", "Usage: upload-file-ref <ref> <path>")
+            ref = args[1]
+            path = args[2]
+            def _upload(pc):
+                pc.observe_page()
+                result = pc.upload_file_ref(ref, path)
+                return self._ok(cmd, result, "Uploaded.")
+            return self._run_with_pc(cmd, _upload)
 
         return self._err(cmd, "unknown_command", f"Unknown command: {cmd!r}")
 
@@ -1058,8 +1396,7 @@ class BrowserToolCLI:
 # Entry point
 # ---------------------------------------------------------------------------
 
-import sys as _sys
-_log = lambda msg: print(msg, file=_sys.stderr)
+_log = lambda msg: print(msg, file=sys.stderr)
 
 
 def safe_local_imports(g: dict) -> None:
@@ -1072,7 +1409,7 @@ def safe_local_imports(g: dict) -> None:
 
 
 def main() -> int:
-    args = _sys.argv[1:]
+    args = sys.argv[1:]
     cli = BrowserToolCLI()
     result = cli.run(args)
     print(json.dumps(result, indent=2))
