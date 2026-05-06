@@ -1529,7 +1529,29 @@ if __name__ == "__main__":
     else:
         # REPL mode — invoked via:
         #   import runpy ; temp = runpy._run_module_as_main("chrome_tools")
-        # Chrome stays alive between re-runs. Edit the command below and re-run.
-        _ss = _ReplSession.get_singleton()
-        _pc = _ss.get_page_controller()
-        #print(json.dumps(_pc.observe_page(), indent=2)) 
+        # Chrome stays alive between re-runs. Edit the lines below and re-run.
+
+        # Dedicated profile where Google credentials are saved.
+        # On first run, Chrome opens and you log into Google manually.
+        # Subsequent runs reuse the same profile — credentials persist.
+        _DA_CONFIG = ChromeLaunchConfig(
+            user_data_dir=r"C:\Temp\chrome_da_profile",
+        )
+
+        _pc = _ReplSession.get_page_controller(config=_DA_CONFIG)
+
+        # --- query tools ---
+        # Uncomment one block at a time and re-run.
+
+        # Snapshot: page metadata + all interactive elements with refs
+        _snap = _pc.observe_page()
+        print(f"url   : {_snap['page']['url']}")
+        print(f"title : {_snap['page']['title']}")
+        print(f"fields: {len(_snap['fields'])}  controls: {len(_snap['controls'])}  uploads: {len(_snap['uploads'])}")
+
+        # Full visible text (first 2000 chars)
+        #_vt = _pc.visible_text(max_chars=2000)
+        #print(_vt["visible_text"])
+
+        # Full snapshot JSON
+        #print(json.dumps(_snap, indent=2))
