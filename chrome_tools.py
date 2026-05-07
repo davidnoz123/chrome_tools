@@ -1285,6 +1285,11 @@ class BrowserToolCLI:
         if cmd == "visible-text-md":
             path = args[1] if len(args) > 1 else None
             return self._cmd_visible_text_md(path)
+        if cmd == "get-page-html":
+            path = args[1] if len(args) > 1 else None
+            return self._cmd_get_page_html(path)
+        if cmd == "get-cookies":
+            return self._cmd_get_cookies()
         if cmd == "list-controls":
             return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"controls": pc.list_controls()}, f"{len(pc.list_controls())} control(s)."))[1])
         if cmd == "list-fields":
@@ -1441,6 +1446,68 @@ class BrowserToolCLI:
                             f"Markdown written to {output_path}")
         return self._ok("visible-text-md", {"markdown": md, "url": url, "chars": len(md)},
                         "Markdown retrieved.")
+
+    def _cmd_get_page_html(self, output_path: str | None = None) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("get-page-html", "chrome_not_running",
+                             f"Chrome is not running on {self._host}:{self._port}.")
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        try:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            page = next((t for t in targets if t["type"] == "page"), None)
+            if page is None:
+                return self._err("get-page-html", "no_page", "No page targets found.")
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            html = session.send("Runtime.evaluate", {
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "")
+            url = session.send("Runtime.evaluate", {
+                "expression": "document.location.href",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "")
+        finally:
+            client.close()
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(html)
+            return self._ok("get-page-html", {"path": output_path, "url": url, "chars": len(html)},
+                            f"HTML written to {output_path}")
+        return self._ok("get-page-html", {"html": html, "url": url, "chars": len(html)},
+                        "Page HTML retrieved.")
+
+    def _cmd_get_cookies(self) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("get-cookies", "chrome_not_running",
+                             f"Chrome is not running on {self._host}:{self._port}.")
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        try:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            page = next((t for t in targets if t["type"] == "page"), None)
+            if page is None:
+                return self._err("get-cookies", "no_page", "No page targets found.")
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            url = session.send("Runtime.evaluate", {
+                "expression": "document.location.href",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "")
+            cookies_result = client.send("Network.getCookies", {"urls": [url]})
+            cookies = cookies_result.get("cookies", [])
+            return self._ok("get-cookies",
+                            {"cookies": cookies, "url": url, "count": len(cookies)},
+                            f"{len(cookies)} cookie(s) retrieved.")
+        finally:
+            client.close()
 
     def _cmd_launch(self) -> dict:
         health = ChromeHealth(self._host, self._port)
