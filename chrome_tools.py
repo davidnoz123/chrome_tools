@@ -1460,7 +1460,24 @@ class _ReplSession:
         _log("REPL: starting Chrome...")
         s["launcher"] = ChromeLauncher(config)
         s["launcher"].start()
-        time.sleep(1)
+        # Poll the CDP endpoint instead of sleeping a fixed time — real user
+        # profiles with extensions can take several seconds to start.
+        _log("REPL: waiting for Chrome CDP endpoint...")
+        _deadline = time.monotonic() + 30
+        while True:
+            try:
+                urllib.request.urlopen(
+                    f"http://localhost:{config.remote_debugging_port}/json/version",
+                    timeout=1,
+                ).close()
+                break
+            except Exception:
+                if time.monotonic() > _deadline:
+                    raise RuntimeError(
+                        f"Chrome did not open CDP endpoint on port "
+                        f"{config.remote_debugging_port} within 30s"
+                    )
+                time.sleep(0.5)
         s["client"] = CDPClient(port=config.remote_debugging_port)
         s["client"].connect()
         s["pc"] = PageController.attach_to_first_page(s["client"])
@@ -1535,7 +1552,8 @@ if __name__ == "__main__":
         # On first run, Chrome opens and you log into Google manually.
         # Subsequent runs reuse the same profile — credentials persist.
         _DA_CONFIG = ChromeLaunchConfig(
-            user_data_dir=r"C:\Temp\chrome_da_profile",
+            #user_data_dir=r"C:\Temp\chrome_da_profile",
+            user_data_dir=r"C:\Users\david\AppData\Local\Google\Chrome\User Data",
         )
 
         _pc = _ReplSession.get_page_controller(config=_DA_CONFIG)
