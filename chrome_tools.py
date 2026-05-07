@@ -9,6 +9,8 @@ import runpy ; temp = runpy._run_module_as_main("chrome_tools")
 
 "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-allow-origins=* --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\ChromeDebugProfile"
 
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-allow-origins=* --remote-debugging-port=9222 --user-data-dir="C:\Users\david\AppData\Local\Google\Chrome\User Data"
+
 """
 
 import base64
@@ -1571,8 +1573,7 @@ if __name__ == "__main__":
         # On first run, Chrome opens and you log into Google manually.
         # Subsequent runs reuse the same profile — credentials persist.
         _DA_CONFIG = ChromeLaunchConfig(
-            #user_data_dir=r"C:\Temp\chrome_da_profile",
-            user_data_dir=r"C:\Users\david\AppData\Local\Google\Chrome\User Data",
+            #user_data_dir=r"C:\Users\david\AppData\Local\Google\Chrome\User Data", # Doesn't work!
         )
 
         _pc = _ReplSession.get_page_controller(config=_DA_CONFIG)
@@ -1586,9 +1587,28 @@ if __name__ == "__main__":
         print(f"title : {_snap['page']['title']}")
         print(f"fields: {len(_snap['fields'])}  controls: {len(_snap['controls'])}  uploads: {len(_snap['uploads'])}")
 
+        # Collapsed expandables (dropdowns/details/accordions not yet open)
+        _collapsed = [
+            e for e in _snap['expandables']
+            if e.get('aria_expanded') in (None, 'false', False)
+        ]
+        if _collapsed:
+            print(f"\ncollapsed expandables ({len(_collapsed)}):")
+            for _e in _collapsed:
+                print(f"  ref={_e['ref']}  tag={_e['tag']}  label={_e.get('label') or _e.get('text') or '(no label)'!r}")
+        else:
+            print("\nno collapsed expandables found")
+
         # Full visible text (first 2000 chars)
         #_vt = _pc.visible_text(max_chars=2000)
         #print(_vt["visible_text"])
 
-        # Full snapshot JSON
-        #print(json.dumps(_snap, indent=2))
+        # Dump full page HTML to a file
+        if True:
+            _html = _pc.evaluate("document.documentElement.outerHTML")
+            _html_path = pathlib.Path("page_dump.html")
+            _html_path.write_text(_html, encoding="utf-8")
+            print(f"HTML written to {_html_path.resolve()}  ({len(_html)} chars)")
+
+            # Full snapshot JSON
+            #print(json.dumps(_snap, indent=2))
