@@ -1457,27 +1457,46 @@ class _ReplSession:
         s = cls._state()
         cls._teardown()
         config = s["config"] or ChromeLaunchConfig()
-        _log("REPL: starting Chrome...")
-        s["launcher"] = ChromeLauncher(config)
-        s["launcher"].start()
-        # Poll the CDP endpoint instead of sleeping a fixed time — real user
-        # profiles with extensions can take several seconds to start.
-        _log("REPL: waiting for Chrome CDP endpoint...")
-        _deadline = time.monotonic() + 30
-        while True:
-            try:
-                urllib.request.urlopen(
-                    f"http://localhost:{config.remote_debugging_port}/json/version",
-                    timeout=1,
-                ).close()
-                break
-            except Exception:
-                if time.monotonic() > _deadline:
+        launcher = ChromeLauncher(config)
+
+        # Try adopting a Chrome that is already listening on the debug port
+        # (e.g. the user launched Chrome manually with --remote-debugging-port).
+        if launcher.adopt():
+            _log(f"REPL: adopted existing Chrome on port {config.remote_debugging_port}")
+            s["launcher"] = launcher
+        else:
+            _log("REPL: starting Chrome...")
+            s["launcher"] = launcher
+            launcher.start()
+            # Poll the CDP endpoint. A 1-second timeout per attempt keeps each
+            # poll fast. If our spawned process exits immediately it means Chrome
+            # delegated the launch to an existing instance that has no debug port —
+            # detect this and give a clear error rather than waiting 30s.
+            _log("REPL: waiting for Chrome CDP endpoint...")
+            _deadline = time.monotonic() + 30
+            while True:
+                if launcher.proc is not None and launcher.proc.poll() is not None:
                     raise RuntimeError(
-                        f"Chrome did not open CDP endpoint on port "
-                        f"{config.remote_debugging_port} within 30s"
+                        f"Chrome process exited immediately (exit code "
+                        f"{launcher.proc.poll()}). An existing Chrome window is "
+                        f"probably open without --remote-debugging-port. "
+                        f"Close all Chrome windows and try again, or use a "
+                        f"separate user_data_dir (e.g. C:\\Temp\\chrome_da_profile)."
                     )
-                time.sleep(0.5)
+                try:
+                    urllib.request.urlopen(
+                        f"http://localhost:{config.remote_debugging_port}/json/version",
+                        timeout=1,
+                    ).close()
+                    break
+                except Exception:
+                    if time.monotonic() > _deadline:
+                        raise RuntimeError(
+                            f"Chrome did not open CDP endpoint on port "
+                            f"{config.remote_debugging_port} within 30s"
+                        )
+                    time.sleep(0.5)
+
         s["client"] = CDPClient(port=config.remote_debugging_port)
         s["client"].connect()
         s["pc"] = PageController.attach_to_first_page(s["client"])
