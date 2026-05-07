@@ -1271,11 +1271,20 @@ class BrowserToolCLI:
             return self._cmd_status()
         if cmd == "pages":
             return self._cmd_pages()
+        if cmd == "launch":
+            return self._cmd_launch()
+        if cmd == "navigate":
+            if len(args) < 2:
+                return self._err(cmd, "missing_arg", "Usage: navigate <url>")
+            return self._cmd_navigate(args[1])
         if cmd == "snapshot":
             return self._run_with_pc(cmd, lambda pc: self._ok(cmd, pc.observe_page(), "Snapshot captured."))
         if cmd == "visible-text":
             max_chars = int(args[1]) if len(args) > 1 else 12000
             return self._run_with_pc(cmd, lambda pc: self._ok(cmd, pc.visible_text(max_chars), "Visible text retrieved."))
+        if cmd == "visible-text-md":
+            path = args[1] if len(args) > 1 else None
+            return self._cmd_visible_text_md(path)
         if cmd == "list-controls":
             return self._run_with_pc(cmd, lambda pc: (pc.observe_page(), self._ok(cmd, {"controls": pc.list_controls()}, f"{len(pc.list_controls())} control(s)."))[1])
         if cmd == "list-fields":
@@ -1394,6 +1403,82 @@ class BrowserToolCLI:
                 for i, t in enumerate(targets) if t["type"] == "page"
             ]
             return self._ok("pages", {"pages": pages}, f"{len(pages)} page(s) found.")
+        finally:
+            client.close()
+
+    def _cmd_visible_text_md(self, output_path: str | None = None) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("visible-text-md", "chrome_not_running",
+                             f"Chrome is not running on {self._host}:{self._port}.")
+        markdownify = _get_versholn().install_and_import("markdownify")
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        try:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            page = next((t for t in targets if t["type"] == "page"), None)
+            if page is None:
+                return self._err("visible-text-md", "no_page", "No page targets found.")
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            html = session.send("Runtime.evaluate", {
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "")
+            url = session.send("Runtime.evaluate", {
+                "expression": "document.location.href",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "")
+        finally:
+            client.close()
+        md = markdownify.markdownify(html, heading_style="ATX", strip=["script", "style"])
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(md)
+            return self._ok("visible-text-md", {"path": output_path, "url": url, "chars": len(md)},
+                            f"Markdown written to {output_path}")
+        return self._ok("visible-text-md", {"markdown": md, "url": url, "chars": len(md)},
+                        "Markdown retrieved.")
+
+    def _cmd_launch(self) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if health.is_alive():
+            return self._ok("launch", {"cdp_port": self._port}, "Chrome is already running.")
+        launcher = ChromeLauncher(ChromeLaunchConfig(
+            remote_debugging_port=self._port,
+            headless=False,
+        ))
+        launcher.start()
+        for _ in range(20):
+            time.sleep(0.5)
+            if health.is_alive():
+                return self._ok("launch", {"cdp_port": self._port}, "Chrome launched.")
+        return self._err("launch", "timeout", "Chrome CDP did not become reachable after 10 s.")
+
+    def _cmd_navigate(self, url: str) -> dict:
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("navigate", "chrome_not_running",
+                             f"Chrome is not running on {self._host}:{self._port}. Run 'launch' first.")
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        try:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            page = next((t for t in targets if t["type"] == "page"), None)
+            if page is None:
+                return self._err("navigate", "no_page", "No page targets found.")
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            session.send("Page.navigate", {"url": url})
+            time.sleep(3)
+            nav_url = session.send("Runtime.evaluate", {
+                "expression": "document.location.href", "returnByValue": True,
+            }).get("result", {}).get("value", "")
+            return self._ok("navigate", {"url": nav_url}, f"Navigated to {nav_url}")
         finally:
             client.close()
 
