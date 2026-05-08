@@ -1379,7 +1379,35 @@ class BrowserToolCLI:
                 return self._ok(cmd, result, "Uploaded.")
             return self._run_with_pc(cmd, _upload)
 
+        if cmd == "monitor":
+            # monitor --target-id <id> --output <path> [--port N]
+            if "--target-id" not in args or "--output" not in args:
+                return self._err(cmd, "missing_arg",
+                                 "Usage: monitor --target-id <id> --output <path> [--port N]")
+            target_id = args[args.index("--target-id") + 1]
+            output_path = args[args.index("--output") + 1]
+            return self._cmd_monitor(target_id, output_path)
+
         return self._err(cmd, "unknown_command", f"Unknown command: {cmd!r}")
+
+    def _cmd_monitor(self, target_id: str, output_path: str) -> dict:
+        """Run NetworkMonitor for target_id until interrupted. Blocks."""
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err("monitor", "chrome_not_running", "Chrome is not running.")
+        _log(f"[monitor] Recording → {output_path}")
+        _log(f"[monitor] target {target_id[:16]}...  Press Ctrl+C to stop.")
+        mon = NetworkMonitor(
+            target_id=target_id, output_path=output_path,
+            host=self._host, port=self._port,
+        )
+        try:
+            mon.run()
+        except KeyboardInterrupt:
+            pass
+        _log(f"[monitor] Stopped. {mon.line_count} event(s) written.")
+        return self._ok("monitor", {"lines": mon.line_count, "output": output_path},
+                        f"{mon.line_count} network event(s) recorded.")
 
     def _cmd_status(self) -> dict:
         health = ChromeHealth(self._host, self._port)
@@ -1548,6 +1576,100 @@ class BrowserToolCLI:
             return self._ok("navigate", {"url": nav_url}, f"Navigated to {nav_url}")
         finally:
             client.close()
+
+
+# ---------------------------------------------------------------------------
+# Network monitor — streams CDP Network events to a JSONL file
+# ---------------------------------------------------------------------------
+
+class NetworkMonitor:
+    """Stream CDP Network events for a specific tab to a JSONL file.
+
+    Each line written is a JSON object::
+
+        {"_t": "<iso-timestamp>", "_event": "<CDP event name>", ...<event params>...}
+
+    Usage (blocking)::
+
+        mon = NetworkMonitor(target_id="abc123", output_path="/tmp/net.jsonl")
+        mon.run()   # blocks until Chrome disconnects or KeyboardInterrupt
+
+    Usage (non-blocking context manager)::
+
+        with NetworkMonitor(target_id, output_path) as mon:
+            time.sleep(30)
+        # thread stopped on __exit__
+    """
+
+    EVENTS = [
+        "Network.requestWillBeSent",
+        "Network.responseReceived",
+        "Network.loadingFinished",
+        "Network.loadingFailed",
+        "Network.requestServedFromCache",
+        "Network.webSocketCreated",
+        "Network.webSocketFrameSent",
+        "Network.webSocketFrameReceived",
+        "Network.webSocketClosed",
+        "Network.eventSourceMessageReceived",
+    ]
+
+    def __init__(self, target_id: str, output_path: str,
+                 host: str = "localhost", port: int = 9222) -> None:
+        self._target_id = target_id
+        self._output_path = output_path
+        self._host = host
+        self._port = port
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.line_count = 0
+
+    def run(self) -> None:
+        """Block until CDP connection drops, stop() is called, or KeyboardInterrupt."""
+        import datetime as _dt
+        client = CDPClient(host=self._host, port=self._port)
+        client.connect()
+        session = CDPSession(client)
+        session.attach(self._target_id)
+        session.send("Network.enable")
+
+        os.makedirs(os.path.dirname(os.path.abspath(self._output_path)), exist_ok=True)
+        with open(self._output_path, "a", encoding="utf-8", buffering=1) as fh:
+            def _make_handler(event_name: str):
+                def _handler(params: dict) -> None:
+                    record = {
+                        "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                        "_event": event_name,
+                    }
+                    record.update(params)
+                    fh.write(json.dumps(record) + "\n")
+                    self.line_count += 1
+                return _handler
+
+            for ev in self.EVENTS:
+                session.on_event(ev, _make_handler(ev))
+
+            try:
+                while not self._stop_event.is_set() and not client.closed.is_set():
+                    client.closed.wait(timeout=1.0)
+            except KeyboardInterrupt:
+                pass
+
+        client.close()
+
+    def stop(self) -> None:
+        """Signal the run() loop to exit cleanly."""
+        self._stop_event.set()
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop()
+        if self._thread:
+            self._thread.join(timeout=5)
 
 
 # ---------------------------------------------------------------------------
