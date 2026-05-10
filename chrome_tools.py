@@ -314,6 +314,47 @@ class EventBus:
             cb(params)
 
 
+def cdp_evaluate(ws_url: str, js: str, timeout: int = 15) -> str:
+    """Evaluate *js* in the tab identified by *ws_url* and return the string result.
+
+    Uses a raw WebSocketApp connection — no CDPClient/CDPSession setup required.
+    Ideal for one-shot reads where you already have the webSocketDebuggerUrl from
+    the CDP HTTP /json endpoint.
+
+    Returns the raw string value from Runtime.evaluate, or '' on timeout/error.
+
+    Example::
+
+        import urllib.request, json
+        targets = json.loads(urllib.request.urlopen('http://localhost:9222/json').read())
+        page = next(t for t in targets if t.get('type') == 'page')
+        html = cdp_evaluate(page['webSocketDebuggerUrl'], 'document.documentElement.outerHTML')
+    """
+    websocket = _get_versholn().install_and_import("websocket-client", import_as="websocket")
+    results: dict = {}
+    done = threading.Event()
+
+    def _on_message(ws, msg):
+        d = json.loads(msg)
+        if d.get("id") == 1:
+            results["value"] = d.get("result", {}).get("result", {}).get("value", "")
+            done.set()
+
+    def _on_open(ws):
+        ws.send(json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {"expression": js, "returnByValue": True},
+        }))
+
+    wsa = websocket.WebSocketApp(ws_url, on_message=_on_message, on_open=_on_open)
+    t = threading.Thread(target=wsa.run_forever, daemon=True)
+    t.start()
+    done.wait(timeout=timeout)
+    wsa.close()
+    return results.get("value", "")
+
+
 class CDPClient:
     def __init__(self, host: str = "localhost", port: int = 9222) -> None:
         self._host = host
@@ -1380,26 +1421,34 @@ class BrowserToolCLI:
             return self._run_with_pc(cmd, _upload)
 
         if cmd == "monitor":
-            # monitor --target-id <id> --output <path> [--port N]
+            # monitor --target-id <id> --output <path> [--port N] [--body-url-patterns p1,p2]
             if "--target-id" not in args or "--output" not in args:
                 return self._err(cmd, "missing_arg",
-                                 "Usage: monitor --target-id <id> --output <path> [--port N]")
+                                 "Usage: monitor --target-id <id> --output <path> [--port N] [--body-url-patterns p1,p2]")
             target_id = args[args.index("--target-id") + 1]
             output_path = args[args.index("--output") + 1]
-            return self._cmd_monitor(target_id, output_path)
+            body_patterns: list[str] = []
+            if "--body-url-patterns" in args:
+                raw = args[args.index("--body-url-patterns") + 1]
+                body_patterns = [p.strip() for p in raw.split(",") if p.strip()]
+            return self._cmd_monitor(target_id, output_path, body_patterns)
 
         return self._err(cmd, "unknown_command", f"Unknown command: {cmd!r}")
 
-    def _cmd_monitor(self, target_id: str, output_path: str) -> dict:
+    def _cmd_monitor(self, target_id: str, output_path: str,
+                      body_url_patterns: list | None = None) -> dict:
         """Run NetworkMonitor for target_id until interrupted. Blocks."""
         health = ChromeHealth(self._host, self._port)
         if not health.is_alive():
             return self._err("monitor", "chrome_not_running", "Chrome is not running.")
         _log(f"[monitor] Recording → {output_path}")
         _log(f"[monitor] target {target_id[:16]}...  Press Ctrl+C to stop.")
+        if body_url_patterns:
+            _log(f"[monitor] Body capture patterns: {body_url_patterns}")
         mon = NetworkMonitor(
             target_id=target_id, output_path=output_path,
             host=self._host, port=self._port,
+            body_url_patterns=body_url_patterns or [],
         )
         try:
             mon.run()
@@ -1589,6 +1638,20 @@ class NetworkMonitor:
 
         {"_t": "<iso-timestamp>", "_event": "<CDP event name>", ...<event params>...}
 
+    Pass *body_url_patterns* to also capture response bodies for matching URLs.
+    When a response whose URL contains any of the patterns finishes loading,
+    the monitor fetches the body via ``Network.getResponseBody`` and writes an
+    extra record with ``_event`` == ``"Network.responseBody"`` and a ``body``
+    field containing the raw text (or base64 if binary).
+
+    Example::
+
+        mon = NetworkMonitor(
+            target_id="abc123",
+            output_path="/tmp/net.jsonl",
+            body_url_patterns=["/graphql", "/api/tasks"],
+        )
+
     Usage (blocking)::
 
         mon = NetworkMonitor(target_id="abc123", output_path="/tmp/net.jsonl")
@@ -1615,11 +1678,13 @@ class NetworkMonitor:
     ]
 
     def __init__(self, target_id: str, output_path: str,
-                 host: str = "localhost", port: int = 9222) -> None:
+                 host: str = "localhost", port: int = 9222,
+                 body_url_patterns: list | None = None) -> None:
         self._target_id = target_id
         self._output_path = output_path
         self._host = host
         self._port = port
+        self._body_url_patterns = body_url_patterns or []
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.line_count = 0
@@ -1633,8 +1698,15 @@ class NetworkMonitor:
         session.attach(self._target_id)
         session.send("Network.enable")
 
+        # requestId -> url for requests whose bodies we want to capture
+        _body_pending: dict[str, str] = {}
+
         os.makedirs(os.path.dirname(os.path.abspath(self._output_path)), exist_ok=True)
         with open(self._output_path, "a", encoding="utf-8", buffering=1) as fh:
+            def _write(record: dict) -> None:
+                fh.write(json.dumps(record) + "\n")
+                self.line_count += 1
+
             def _make_handler(event_name: str):
                 def _handler(params: dict) -> None:
                     record = {
@@ -1642,8 +1714,39 @@ class NetworkMonitor:
                         "_event": event_name,
                     }
                     record.update(params)
-                    fh.write(json.dumps(record) + "\n")
-                    self.line_count += 1
+                    _write(record)
+
+                    # Track interesting responses for body capture
+                    if event_name == "Network.responseReceived" and self._body_url_patterns:
+                        url = params.get("response", {}).get("url", "") or params.get("url", "")
+                        if any(pat in url for pat in self._body_url_patterns):
+                            _body_pending[params["requestId"]] = url
+
+                    # When a tracked request finishes, fetch its body
+                    if event_name == "Network.loadingFinished" and self._body_url_patterns:
+                        req_id = params.get("requestId", "")
+                        url = _body_pending.pop(req_id, None)
+                        if url:
+                            try:
+                                result = session.send("Network.getResponseBody", {"requestId": req_id})
+                                body_record = {
+                                    "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                    "_event": "Network.responseBody",
+                                    "requestId": req_id,
+                                    "url": url,
+                                    "body": result.get("body", ""),
+                                    "base64Encoded": result.get("base64Encoded", False),
+                                }
+                                _write(body_record)
+                            except Exception as exc:
+                                _write({
+                                    "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                    "_event": "Network.responseBodyError",
+                                    "requestId": req_id,
+                                    "url": url,
+                                    "error": str(exc),
+                                })
+
                 return _handler
 
             for ev in self.EVENTS:
