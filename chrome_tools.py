@@ -1696,7 +1696,12 @@ class NetworkMonitor:
         client.connect()
         session = CDPSession(client)
         session.attach(self._target_id)
-        session.send("Network.enable")
+        # Enable network tracking with a generous body buffer so getResponseBody
+        # succeeds before Chrome evicts small JSON responses (default buffer is ~1 MB).
+        session.send("Network.enable", {
+            "maxResourceBufferSize": 10 * 1024 * 1024,   # 10 MB per resource
+            "maxTotalBufferSize":    40 * 1024 * 1024,   # 40 MB total
+        })
 
         # requestId -> url for requests whose bodies we want to capture
         _body_pending: dict[str, str] = {}
@@ -1716,36 +1721,69 @@ class NetworkMonitor:
                     record.update(params)
                     _write(record)
 
+                    # Capture request (POST) body as soon as the request is registered.
+                    # getRequestPostData is available immediately after requestWillBeSent.
+                    if event_name == "Network.requestWillBeSent" and self._body_url_patterns:
+                        req_url = params.get("request", {}).get("url", "")
+                        has_post = params.get("request", {}).get("hasPostData", False)
+                        if has_post and any(pat in req_url for pat in self._body_url_patterns):
+                            req_id = params.get("requestId", "")
+                            def _fetch_request_body(req_id=req_id, url=req_url):
+                                try:
+                                    result = session.send("Network.getRequestPostData", {"requestId": req_id})
+                                    _write({
+                                        "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                        "_event": "Network.requestPostData",
+                                        "requestId": req_id,
+                                        "url": url,
+                                        "postData": result.get("postData", ""),
+                                    })
+                                except Exception as exc:
+                                    _write({
+                                        "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                        "_event": "Network.requestPostDataError",
+                                        "requestId": req_id,
+                                        "url": url,
+                                        "error": str(exc),
+                                    })
+                            threading.Thread(target=_fetch_request_body, daemon=True).start()
+
                     # Track interesting responses for body capture
                     if event_name == "Network.responseReceived" and self._body_url_patterns:
                         url = params.get("response", {}).get("url", "") or params.get("url", "")
                         if any(pat in url for pat in self._body_url_patterns):
                             _body_pending[params["requestId"]] = url
 
-                    # When a tracked request finishes, fetch its body
+                    # When a tracked request finishes, fetch its body.
+                    # Must run in a separate thread: dispatch() is called synchronously
+                    # from _recv_loop, so calling session.send() here would deadlock
+                    # (send waits for _recv_loop to deliver the response, but _recv_loop
+                    # is blocked waiting for this handler to return).
                     if event_name == "Network.loadingFinished" and self._body_url_patterns:
                         req_id = params.get("requestId", "")
                         url = _body_pending.pop(req_id, None)
                         if url:
-                            try:
-                                result = session.send("Network.getResponseBody", {"requestId": req_id})
-                                body_record = {
-                                    "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                    "_event": "Network.responseBody",
-                                    "requestId": req_id,
-                                    "url": url,
-                                    "body": result.get("body", ""),
-                                    "base64Encoded": result.get("base64Encoded", False),
-                                }
-                                _write(body_record)
-                            except Exception as exc:
-                                _write({
-                                    "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-                                    "_event": "Network.responseBodyError",
-                                    "requestId": req_id,
-                                    "url": url,
-                                    "error": str(exc),
-                                })
+                            def _fetch_body(req_id=req_id, url=url):
+                                try:
+                                    result = session.send("Network.getResponseBody", {"requestId": req_id})
+                                    body_record = {
+                                        "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                        "_event": "Network.responseBody",
+                                        "requestId": req_id,
+                                        "url": url,
+                                        "body": result.get("body", ""),
+                                        "base64Encoded": result.get("base64Encoded", False),
+                                    }
+                                    _write(body_record)
+                                except Exception as exc:
+                                    _write({
+                                        "_t": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                                        "_event": "Network.responseBodyError",
+                                        "requestId": req_id,
+                                        "url": url,
+                                        "error": str(exc),
+                                    })
+                            threading.Thread(target=_fetch_body, daemon=True).start()
 
                 return _handler
 
