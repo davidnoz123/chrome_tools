@@ -1271,6 +1271,174 @@ class PageController:
 # CLI
 # ---------------------------------------------------------------------------
 
+_PAGE_SNAPSHOT_JS = r"""(function(includeHidden) {
+  "use strict";
+  var lines = [], hiddenN = 0;
+  var SKIP = {SCRIPT:1,STYLE:1,NOSCRIPT:1,SVG:1,CANVAS:1,IFRAME:1,HEAD:1,META:1,LINK:1,OBJECT:1,EMBED:1};
+  var INLINE = {SPAN:1,STRONG:1,B:1,EM:1,I:1,SMALL:1,SUP:1,SUB:1,MARK:1,ABBR:1,CITE:1,
+                S:1,DEL:1,INS:1,U:1,TIME:1,KBD:1,SAMP:1,VAR:1,BDI:1,BDO:1,WBR:1,LABEL:1};
+  function isHid(el) {
+    try { var s = window.getComputedStyle(el);
+      if (s.display === 'none' || s.visibility === 'hidden') return true;
+    } catch(e) {}
+    if (el.hidden) return true;
+    if (el.getAttribute('aria-hidden') === 'true') return true;
+    return false;
+  }
+  function desc(el) {
+    var d = el.tagName.toLowerCase();
+    if (el.id) d += '#' + el.id;
+    else if (el.className && typeof el.className === 'string') {
+      var c = el.className.trim().split(/\s+/).slice(0,2).join('.');
+      if (c) d += '.' + c;
+    }
+    var r = el.getAttribute ? el.getAttribute('role') : null;
+    if (r) d += '[role="' + r + '"]';
+    return d;
+  }
+  function getlbl(el) {
+    if (el.id) { var lb = document.querySelector('label[for="' + el.id + '"]');
+      if (lb) return lb.textContent.trim(); }
+    var a = el.getAttribute ? el.getAttribute('aria-label') : null;
+    if (a) return a.trim();
+    var lid = el.getAttribute ? el.getAttribute('aria-labelledby') : null;
+    if (lid) { var le = document.getElementById(lid); if (le) return le.textContent.trim(); }
+    return '';
+  }
+  function gettxt(el, h) {
+    try { return h ? (el.textContent||'').trim() : (el.innerText||'').trim(); } catch(e) { return ''; }
+  }
+  function extractLinks(el, pfx, h) {
+    var as = el.querySelectorAll('a[href]');
+    for (var i = 0; i < as.length; i++) {
+      var a = as[i], t = gettxt(a, h), href = a.href || '';
+      if (t && href && href.indexOf('javascript:') !== 0)
+        lines.push(pfx + '\u2192 [' + t + '](' + href + ')');
+    }
+  }
+  function blank() { if (lines.length && lines[lines.length-1] !== '') lines.push(''); }
+  function walk(node, h) {
+    if (!node) return;
+    if (node.nodeType === 3) {
+      var t = (node.textContent||'').trim();
+      if (t) lines.push((h ? '> ' : '') + t);
+      return;
+    }
+    if (node.nodeType !== 1) return;
+    var tag = node.tagName;
+    if (!tag || SKIP[tag]) return;
+    if (INLINE[tag]) {
+      for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i], h);
+      return;
+    }
+    var hid = isHid(node);
+    if (hid && !includeHidden) return;
+    if (hid && !h) {
+      hiddenN++;
+      var n = hiddenN;
+      blank();
+      lines.push('<!-- hidden-block:' + n + ' ' + desc(node) + ' -->');
+      for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i], true);
+      lines.push('<!-- /hidden-block:' + n + ' -->');
+      blank();
+      return;
+    }
+    var p = h ? '> ' : '';
+    if (/^H[1-6]$/.test(tag)) {
+      var t = gettxt(node, h);
+      if (t) lines.push(p + Array(parseInt(tag[1])+1).join('#') + ' ' + t);
+      extractLinks(node, p, h); return;
+    }
+    if (tag === 'P') {
+      var t = gettxt(node, h);
+      if (t) { lines.push(p + t); extractLinks(node, p, h); blank(); } return;
+    }
+    if (tag === 'A') {
+      var t = gettxt(node, h), href = node.href || '';
+      if (t && href && href.indexOf('javascript:') !== 0) lines.push(p + '[' + t + '](' + href + ')');
+      else if (t) lines.push(p + t);
+      return;
+    }
+    if (tag === 'UL' || tag === 'OL') {
+      var ord = tag === 'OL', idx = 0;
+      for (var i = 0; i < node.children.length; i++) {
+        var li = node.children[i];
+        if (li.tagName === 'LI') {
+          idx++;
+          var t = gettxt(li, h);
+          if (t) lines.push(p + (ord ? idx + '. ' : '- ') + t);
+          extractLinks(li, p + '  ', h);
+        }
+      }
+      blank(); return;
+    }
+    if (tag === 'LI') {
+      var t = gettxt(node, h);
+      if (t) lines.push(p + '- ' + t);
+      extractLinks(node, p + '  ', h); return;
+    }
+    if (tag === 'INPUT') {
+      var type = (node.type || 'text').toLowerCase(), lb = getlbl(node);
+      if (type === 'checkbox') { lines.push(p + (node.checked ? '[x]' : '[ ]') + (lb ? ' ' + lb : '')); return; }
+      if (type === 'radio') { lines.push(p + (node.checked ? '(\u2022)' : '( )') + (lb ? ' ' + lb : '')); return; }
+      if (type === 'hidden') return;
+      if (type === 'submit' || type === 'button') { lines.push(p + '**[Button: ' + (node.value || lb || type) + ']**'); return; }
+      var val = (node.value || '').trim(), ph = node.placeholder || '';
+      lines.push(p + '[Input' + (lb ? ':' + lb : '') + (val ? '="' + val + '"' : (ph ? ' placeholder="' + ph + '"' : '')) + ']');
+      return;
+    }
+    if (tag === 'TEXTAREA') {
+      var lb = getlbl(node), val = (node.value || '').trim();
+      lines.push(p + '[Textarea' + (lb ? ':' + lb : '') + (val ? '="' + val + '"' : '') + ']'); return;
+    }
+    if (tag === 'SELECT') {
+      var lb = getlbl(node), sel = node.options && node.selectedIndex >= 0 ? node.options[node.selectedIndex] : null;
+      lines.push(p + '[Select' + (lb ? ':' + lb : '') + (sel ? '="' + sel.text.trim() + '"' : '') + ']'); return;
+    }
+    if (tag === 'BUTTON') {
+      var t = gettxt(node, h); if (t) lines.push(p + '**[Button: ' + t + ']**'); return;
+    }
+    if (tag === 'IMG') {
+      var alt = node.alt || ''; if (alt) lines.push(p + '[Image: ' + alt + ']'); return;
+    }
+    if (tag === 'TABLE') {
+      var rows = node.querySelectorAll('tr'), first = true;
+      rows.forEach(function(row) {
+        var cells = row.querySelectorAll('td,th');
+        if (!cells.length) return;
+        var parts = [];
+        cells.forEach(function(c) { parts.push(gettxt(c, h).replace(/\|/g, '\\|').replace(/\n/g, ' ')); });
+        lines.push(p + '| ' + parts.join(' | ') + ' |');
+        if (first) { lines.push(p + '|' + parts.map(function(){return ' --- ';}).join('|') + '|'); first = false; }
+      });
+      blank(); return;
+    }
+    if (tag === 'PRE') {
+      var t = (node.textContent||'').trim();
+      if (t) { lines.push(p + '```'); lines.push(t); lines.push(p + '```'); blank(); } return;
+    }
+    if (tag === 'CODE') {
+      var t = gettxt(node, h); if (t) lines.push(p + '`' + t + '`'); return;
+    }
+    if (tag === 'BLOCKQUOTE') {
+      var t = gettxt(node, h);
+      if (t) t.split('\n').forEach(function(l) { lines.push(p + '> ' + l.trim()); });
+      blank(); return;
+    }
+    if (tag === 'HR') { lines.push(p + '---'); return; }
+    if (tag === 'BR') { blank(); return; }
+    if (tag === 'SUMMARY') { var t = gettxt(node, h); if (t) lines.push(p + '**' + t + '**'); return; }
+    for (var i = 0; i < node.childNodes.length; i++) walk(node.childNodes[i], h);
+    if (tag==='DIV'||tag==='SECTION'||tag==='ARTICLE'||tag==='MAIN'||tag==='ASIDE'||
+        tag==='HEADER'||tag==='FOOTER'||tag==='NAV'||tag==='FORM'||tag==='FIELDSET'||
+        tag==='FIGURE'||tag==='DETAILS') blank();
+  }
+  if (!document.body) return '';
+  walk(document.body, false);
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+})"""
+
+
 class BrowserToolCLI:
     def __init__(self, host: str = "localhost", port: int = 9222,
                  target_id: str | None = None,
@@ -1344,6 +1512,10 @@ class BrowserToolCLI:
         if cmd == "visible-text-md":
             path = args[1] if len(args) > 1 else None
             return self._cmd_visible_text_md(path)
+        if cmd == "page-snapshot-md":
+            include_hidden = "--include-hidden" in args
+            path = next((a for a in args[1:] if not a.startswith("--")), None)
+            return self._cmd_page_snapshot_md(include_hidden, path)
         if cmd == "get-page-html":
             path = args[1] if len(args) > 1 else None
             return self._cmd_get_page_html(path)
@@ -1541,6 +1713,56 @@ class BrowserToolCLI:
                             f"Markdown written to {output_path}")
         return self._ok("visible-text-md", {"markdown": md, "url": url, "chars": len(md)},
                         "Markdown retrieved.")
+
+    def _cmd_page_snapshot_md(self, include_hidden: bool = False,
+                               output_path: str | None = None) -> dict:
+        cmd = "page-snapshot-md"
+        health = ChromeHealth(self._host, self._port)
+        if not health.is_alive():
+            return self._err(cmd, "chrome_not_running",
+                             f"Chrome is not running on {self._host}:{self._port}.")
+        owned = self._client is None
+        client = self._client if not owned else CDPClient(host=self._host, port=self._port)
+        try:
+            if owned:
+                client.connect()
+            if self._target_id is not None:
+                result = client.send("Target.getTargets")
+                targets = result.get("targetInfos", [])
+                page = next((t for t in targets if t["targetId"] == self._target_id), None)
+                if page is None:
+                    return self._err(cmd, "no_target",
+                                     f"Target {self._target_id[:16]}... not found.")
+            else:
+                result = client.send("Target.getTargets")
+                targets = result.get("targetInfos", [])
+                page = next((t for t in targets if t["type"] == "page"), None)
+                if page is None:
+                    return self._err(cmd, "no_page", "No page targets found.")
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            js = _PAGE_SNAPSHOT_JS + "(" + ("true" if include_hidden else "false") + ")"
+            md = session.send("Runtime.evaluate", {
+                "expression": js,
+                "returnByValue": True,
+            }).get("result", {}).get("value", "") or ""
+            url = session.send("Runtime.evaluate", {
+                "expression": "document.location.href",
+                "returnByValue": True,
+            }).get("result", {}).get("value", "") or ""
+        except Exception as exc:
+            return self._err(cmd, "error", str(exc))
+        finally:
+            if owned:
+                client.close()
+        if output_path:
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(md)
+            return self._ok(cmd, {"path": output_path, "url": url, "chars": len(md)},
+                            f"Page snapshot written to {output_path}")
+        return self._ok(cmd, {"markdown": md, "url": url, "chars": len(md)},
+                        "Page snapshot captured.")
 
     def _cmd_get_page_html(self, output_path: str | None = None) -> dict:
         health = ChromeHealth(self._host, self._port)
