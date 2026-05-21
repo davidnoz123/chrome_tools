@@ -1272,9 +1272,13 @@ class PageController:
 # ---------------------------------------------------------------------------
 
 class BrowserToolCLI:
-    def __init__(self, host: str = "localhost", port: int = 9222) -> None:
+    def __init__(self, host: str = "localhost", port: int = 9222,
+                 target_id: str | None = None,
+                 client: "CDPClient | None" = None) -> None:
         self._host = host
         self._port = port
+        self._target_id = target_id
+        self._client = client  # pre-connected persistent client (REPL mode); not closed after each command
 
     def _ok(self, command: str, data: dict | None = None, message: str = "") -> dict:
         return {"ok": True, "command": command, "message": message, "data": data or {}, "warnings": []}
@@ -1284,10 +1288,23 @@ class BrowserToolCLI:
                 "message": message, "data": data or {}, "warnings": []}
 
     def _connect_pc(self) -> tuple[CDPClient, PageController]:
-        client = CDPClient(host=self._host, port=self._port)
-        client.connect()
-        pc = PageController.attach_to_first_page(client)
-        return client, pc
+        client = self._client
+        if client is None:
+            client = CDPClient(host=self._host, port=self._port)
+            client.connect()
+        if self._target_id is not None:
+            result = client.send("Target.getTargets")
+            targets = result.get("targetInfos", [])
+            page = next((t for t in targets if t["targetId"] == self._target_id), None)
+            if page is None:
+                raise RuntimeError(
+                    f"Target {self._target_id[:16]}... not found (was the tab closed?)"
+                )
+            session = CDPSession(client)
+            session.attach(page["targetId"])
+            session.send("Runtime.enable")
+            return client, PageController(session)
+        return client, PageController.attach_to_first_page(client)
 
     def _run_with_pc(self, cmd: str, fn) -> dict:
         health = ChromeHealth(self._host, self._port)
@@ -1299,7 +1316,8 @@ class BrowserToolCLI:
             try:
                 return fn(pc)
             finally:
-                client.close()
+                if self._client is None:  # we created it — close it
+                    client.close()
         except Exception as exc:
             return self._err(cmd, "error", str(exc))
 
