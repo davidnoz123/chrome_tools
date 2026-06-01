@@ -4,5 +4,8 @@
     "AGENTS.base",
     "profiles/python-cli",
     "profiles/python-chrome-cdp"
+  ],
+  "path_check_ignore": [
+    "Temp"
   ]
 }
