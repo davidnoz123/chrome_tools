@@ -1919,12 +1919,26 @@ class NetworkMonitor:
 
     def __init__(self, target_id: str, output_path: str,
                  host: str = "localhost", port: int = 9222,
-                 body_url_patterns: list | None = None) -> None:
+                 body_url_patterns: list | None = None,
+                 client: "CDPClient | None" = None) -> None:
         self._target_id = target_id
         self._output_path = output_path
         self._host = host
         self._port = port
         self._body_url_patterns = body_url_patterns or []
+        # Pre-connected client, as BrowserToolCLI already accepts. Optional, so
+        # every existing caller keeps its own connection and its own teardown.
+        #
+        # Two clients on one target work -- measured 2026-08-17, 73 events
+        # captured while a second client drove the same tab -- so this is for
+        # callers that would rather hold one connection than two, not a fix for
+        # anything broken. A shared client is safe to send on from the monitor's
+        # threads: websocket-client serialises writes itself
+        # (enable_multithread defaults True), and CDPClient's own lock keeps
+        # command ids unique.
+        #
+        # A client passed in is NOT closed by run(); whoever made it owns it.
+        self._client = client
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.line_count = 0
@@ -1932,8 +1946,11 @@ class NetworkMonitor:
     def run(self) -> None:
         """Block until CDP connection drops, stop() is called, or KeyboardInterrupt."""
         import datetime as _dt
-        client = CDPClient(host=self._host, port=self._port)
-        client.connect()
+        owned = self._client is None
+        client = self._client
+        if owned:
+            client = CDPClient(host=self._host, port=self._port)
+            client.connect()
         session = CDPSession(client)
         session.attach(self._target_id)
         # Enable network tracking with a generous body buffer so getResponseBody
@@ -2036,7 +2053,8 @@ class NetworkMonitor:
             except KeyboardInterrupt:
                 pass
 
-        client.close()
+        if owned:            # we created it -- close it
+            client.close()
 
     def stop(self) -> None:
         """Signal the run() loop to exit cleanly."""
