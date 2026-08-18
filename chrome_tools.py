@@ -356,9 +356,17 @@ def cdp_evaluate(ws_url: str, js: str, timeout: int = 15) -> str:
 
 
 class CDPClient:
-    def __init__(self, host: str = "localhost", port: int = 9222) -> None:
+    #: Seconds to wait for a reply before raising CDPTimeout. Ten was the
+    #: hard-coded value for as long as this class existed; it stays the default
+    #: so nothing that worked before starts failing, and is now raisable by a
+    #: caller who knows its payload is large.
+    DEFAULT_TIMEOUT = 10.0
+
+    def __init__(self, host: str = "localhost", port: int = 9222,
+                 timeout: float | None = None) -> None:
         self._host = host
         self._port = port
+        self._timeout = self.DEFAULT_TIMEOUT if timeout is None else timeout
         self.ws = None
         self.event_bus = EventBus()
         self.sessions: dict[str, "CDPSession"] = {}
@@ -388,7 +396,14 @@ class CDPClient:
                     pass
             self.ws = None
 
-    def send(self, method: str, params: dict | None = None, session_id: str | None = None) -> dict:
+    def send(self, method: str, params: dict | None = None, session_id: str | None = None,
+             timeout: float | None = None) -> dict:
+        """Send a CDP command and return its result.
+
+        Raises CDPTimeout if nothing arrives within *timeout* (default
+        DEFAULT_TIMEOUT). An empty dict now means only what it says: the command
+        answered and had nothing to report.
+        """
         with self._send_lock:
             cmd_id = self._next_id
             self._next_id += 1
@@ -404,8 +419,14 @@ class CDPClient:
             self._pending.pop(cmd_id, None)
             raise RuntimeError("connection closed")
 
-        self._pending[cmd_id]["event"].wait(timeout=10)
+        waited = self._timeout if timeout is None else timeout
+        arrived = self._pending[cmd_id]["event"].wait(timeout=waited)
         entry = self._pending.pop(cmd_id, {})
+        if not arrived:
+            raise CDPTimeout(
+                f"{method} did not answer within {waited:g}s. If the payload is "
+                f"large, pass a longer timeout to send() or to CDPClient()."
+            )
         if entry.get("error"):
             raise RuntimeError(f"CDP error: {entry['error']}")
         return entry.get("result") or {}
@@ -546,8 +567,10 @@ class CDPSession:
             self.client.sessions.pop(self._session_id, None)
             self._session_id = None
 
-    def send(self, method: str, params: dict | None = None) -> dict:
-        return self.client.send(method, params, session_id=self._session_id)
+    def send(self, method: str, params: dict | None = None,
+             timeout: float | None = None) -> dict:
+        return self.client.send(method, params, session_id=self._session_id,
+                                timeout=timeout)
 
     def on_event(self, event: str, callback) -> None:
         self._event_bus.subscribe(event, callback)
@@ -606,6 +629,22 @@ _DANGEROUS_WORDS = (
     "submit", "complete", "finish", "finalize", "accept",
     "start task", "delete", "discard", "leave page",
 )
+
+
+class CDPTimeout(RuntimeError):
+    """A CDP command was sent and nothing came back inside the timeout.
+
+    Raised rather than returned, because the alternative was an empty dict --
+    indistinguishable from the many commands that legitimately answer with no
+    payload. A caller reading a photograph out of a page got a successful empty
+    read and carried on, which is the silent-failure shape AGENTS.md puts first.
+
+    Measured 2026-08-17 from stock_capture: base64 transfer over one CDP frame
+    runs at roughly 1.1 seconds per raw megabyte, so the old hard-coded ten
+    seconds was reached at about **9 MB**. A 2-5 MB site photograph was
+    comfortably inside it; a burst-mode or 48-megapixel frame was not, and the
+    failure looked like success.
+    """
 
 
 class BlockedActionError(Exception):
